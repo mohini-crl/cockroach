@@ -74,3 +74,5 @@ type PreFiltererStateForInvertedFilterer struct {
 	// Col is the column id of the single variable in the expression.
 	Col opt.ColumnID
 }
+
+// Random change 2024-12-19 18:47:24.516627
