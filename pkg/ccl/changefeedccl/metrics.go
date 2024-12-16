@@ -83,6 +83,7 @@ type AggMetrics struct {
 	CloudstorageBufferedBytes   *aggmetric.AggGauge
 	KafkaThrottlingNanos        *aggmetric.AggHistogram
 	SinkErrors                  *aggmetric.AggCounter
+	FooBar                      *aggmetric.AggGauge
 
 	Timers *timers.Timers
 
@@ -165,6 +166,7 @@ type sliMetrics struct {
 	CloudstorageBufferedBytes   *aggmetric.Gauge
 	KafkaThrottlingNanos        *aggmetric.Histogram
 	SinkErrors                  *aggmetric.Counter
+	FooBar                      *aggmetric.Gauge
 
 	Timers *timers.ScopedTimers
 
@@ -986,6 +988,12 @@ func newAggregateMetrics(histogramWindow time.Duration, lookup *cidr.Lookup) *Ag
 		Measurement: "Count",
 		Unit:        metric.Unit_COUNT,
 	}
+	metaFooBar := metric.Metadata{
+		Name:        "changefeed.foo_bar",
+		Help:        "yadda yadda",
+		Measurement: "Nanoseconds",
+		Unit:        metric.Unit_NANOSECONDS,
+	}
 
 	functionalGaugeMinFn := func(childValues []int64) int64 {
 		var min int64
@@ -1088,6 +1096,16 @@ func newAggregateMetrics(histogramWindow time.Duration, lookup *cidr.Lookup) *Ag
 			BucketConfig: metric.ChangefeedBatchLatencyBuckets,
 		}),
 		SinkErrors: b.Counter(metaSinkErrors),
+		FooBar: b.FunctionalGauge(metaFooBar, func(vals []int64) int64 {
+			now := timeutil.Now()
+			var maxBehind time.Duration
+			for _, resolved := range vals {
+				if behind := now.Sub(hlc.Timestamp{WallTime: resolved}.GoTime()); behind > maxBehind {
+					maxBehind = behind
+				}
+			}
+			return maxBehind.Nanoseconds()
+		}),
 		Timers:     timers.New(histogramWindow),
 		NetMetrics: lookup.MakeNetMetrics(metaNetworkBytesOut, metaNetworkBytesIn, "sink"),
 	}
@@ -1141,7 +1159,7 @@ func (a *AggMetrics) getOrCreateScope(scope string) (*sliMetrics, error) {
 		SizeBasedFlushes:            a.SizeBasedFlushes.AddChild(scope),
 		ParallelIOPendingQueueNanos: a.ParallelIOPendingQueueNanos.AddChild(scope),
 		ParallelIOPendingRows:       a.ParallelIOPendingRows.AddChild(scope),
-		ParallelIOResultQueueNanos:  a.ParallelIOResultQueueNanos.AddChild(scope),
+		ParallelIOResultQueueNanos:  a.ParallelIOResultQueueNanos.AddChild(scope), // we add a child scope?
 		ParallelIOInFlightKeys:      a.ParallelIOInFlightKeys.AddChild(scope),
 		SinkIOInflight:              a.SinkIOInflight.AddChild(scope),
 		CommitLatency:               a.CommitLatency.AddChild(scope),
@@ -1189,6 +1207,7 @@ func (a *AggMetrics) getOrCreateScope(scope string) (*sliMetrics, error) {
 	}
 	sm.AggregatorProgress = a.AggregatorProgress.AddFunctionalChild(minTimestampGetter(sm.mu.resolved), scope)
 	sm.CheckpointProgress = a.CheckpointProgress.AddFunctionalChild(minTimestampGetter(sm.mu.checkpoint), scope)
+	sm.FooBar = a.FooBar.AddFunctionalChild(minTimestampGetter(sm.mu.resolved), scope)
 
 	a.mu.sliMetrics[scope] = sm
 	return sm, nil

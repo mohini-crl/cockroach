@@ -1233,14 +1233,14 @@ func newChangeFrontierProcessor(
 		return nil, err
 	}
 
-	sliMertics, err := flowCtx.Cfg.JobRegistry.MetricsStruct().Changefeed.(*Metrics).getSLIMetrics(cf.spec.Feed.Opts[changefeedbase.OptMetricsScope])
+	sliMetrics, err := flowCtx.Cfg.JobRegistry.MetricsStruct().Changefeed.(*Metrics).getSLIMetrics(cf.spec.Feed.Opts[changefeedbase.OptMetricsScope])
 	if err != nil {
 		return nil, err
 	}
 
 	if cf.encoder, err = getEncoder(
 		ctx, encodingOpts, AllTargets(spec.Feed), spec.Feed.Select != "",
-		makeExternalConnectionProvider(ctx, flowCtx.Cfg.DB), sliMertics,
+		makeExternalConnectionProvider(ctx, flowCtx.Cfg.DB), sliMetrics,
 	); err != nil {
 		return nil, err
 	}
