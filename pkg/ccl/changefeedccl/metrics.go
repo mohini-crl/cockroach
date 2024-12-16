@@ -83,7 +83,7 @@ type AggMetrics struct {
 	CloudstorageBufferedBytes   *aggmetric.AggGauge
 	KafkaThrottlingNanos        *aggmetric.AggHistogram
 	SinkErrors                  *aggmetric.AggCounter
-	FooBar                      *aggmetric.AggGauge
+	MaxBehindNanos              *aggmetric.AggGauge
 
 	Timers *timers.Timers
 
@@ -166,7 +166,7 @@ type sliMetrics struct {
 	CloudstorageBufferedBytes   *aggmetric.Gauge
 	KafkaThrottlingNanos        *aggmetric.Histogram
 	SinkErrors                  *aggmetric.Counter
-	FooBar                      *aggmetric.Gauge
+	MaxBehindNanos              *aggmetric.Gauge
 
 	Timers *timers.ScopedTimers
 
@@ -723,17 +723,6 @@ var (
 		Unit:        metric.Unit_NANOSECONDS,
 	}
 
-	// TODO(dan): This was intended to be a measure of the minimum distance of
-	// any changefeed ahead of its gc ttl threshold, but keeping that correct in
-	// the face of changing zone configs is much harder, so this will have to do
-	// for now.
-	metaChangefeedMaxBehindNanos = metric.Metadata{
-		Name:        "changefeed.max_behind_nanos",
-		Help:        "(Deprecated in favor of checkpoint_progress) The most any changefeed's persisted checkpoint is behind the present",
-		Measurement: "Nanoseconds",
-		Unit:        metric.Unit_NANOSECONDS,
-	}
-
 	metaChangefeedFrontierUpdates = metric.Metadata{
 		Name:        "changefeed.frontier_updates",
 		Help:        "Number of change frontier updates across all feeds",
@@ -988,9 +977,13 @@ func newAggregateMetrics(histogramWindow time.Duration, lookup *cidr.Lookup) *Ag
 		Measurement: "Count",
 		Unit:        metric.Unit_COUNT,
 	}
-	metaFooBar := metric.Metadata{
-		Name:        "changefeed.foo_bar",
-		Help:        "yadda yadda",
+	// TODO(dan): This was intended to be a measure of the minimum distance of
+	// any changefeed ahead of its gc ttl threshold, but keeping that correct in
+	// the face of changing zone configs is much harder, so this will have to do
+	// for now.
+	metaChangefeedMaxBehindNanos := metric.Metadata{
+		Name:        "changefeed.max_behind_nanos",
+		Help:        "(Deprecated in favor of checkpoint_progress) The most any changefeed's persisted checkpoint is behind the present",
 		Measurement: "Nanoseconds",
 		Unit:        metric.Unit_NANOSECONDS,
 	}
@@ -1096,10 +1089,13 @@ func newAggregateMetrics(histogramWindow time.Duration, lookup *cidr.Lookup) *Ag
 			BucketConfig: metric.ChangefeedBatchLatencyBuckets,
 		}),
 		SinkErrors: b.Counter(metaSinkErrors),
-		FooBar: b.FunctionalGauge(metaFooBar, func(vals []int64) int64 {
+		MaxBehindNanos: b.FunctionalGauge(metaChangefeedMaxBehindNanos, func(vals []int64) int64 {
 			now := timeutil.Now()
 			var maxBehind time.Duration
 			for _, resolved := range vals {
+				if resolved == 0 {
+					continue
+				}
 				if behind := now.Sub(hlc.Timestamp{WallTime: resolved}.GoTime()); behind > maxBehind {
 					maxBehind = behind
 				}
@@ -1159,7 +1155,7 @@ func (a *AggMetrics) getOrCreateScope(scope string) (*sliMetrics, error) {
 		SizeBasedFlushes:            a.SizeBasedFlushes.AddChild(scope),
 		ParallelIOPendingQueueNanos: a.ParallelIOPendingQueueNanos.AddChild(scope),
 		ParallelIOPendingRows:       a.ParallelIOPendingRows.AddChild(scope),
-		ParallelIOResultQueueNanos:  a.ParallelIOResultQueueNanos.AddChild(scope), // we add a child scope?
+		ParallelIOResultQueueNanos:  a.ParallelIOResultQueueNanos.AddChild(scope),
 		ParallelIOInFlightKeys:      a.ParallelIOInFlightKeys.AddChild(scope),
 		SinkIOInflight:              a.SinkIOInflight.AddChild(scope),
 		CommitLatency:               a.CommitLatency.AddChild(scope),
@@ -1207,7 +1203,7 @@ func (a *AggMetrics) getOrCreateScope(scope string) (*sliMetrics, error) {
 	}
 	sm.AggregatorProgress = a.AggregatorProgress.AddFunctionalChild(minTimestampGetter(sm.mu.resolved), scope)
 	sm.CheckpointProgress = a.CheckpointProgress.AddFunctionalChild(minTimestampGetter(sm.mu.checkpoint), scope)
-	sm.FooBar = a.FooBar.AddFunctionalChild(minTimestampGetter(sm.mu.resolved), scope)
+	sm.MaxBehindNanos = a.MaxBehindNanos.AddFunctionalChild(minTimestampGetter(sm.mu.resolved), scope)
 
 	a.mu.sliMetrics[scope] = sm
 	return sm, nil
@@ -1264,14 +1260,13 @@ type Metrics struct {
 	ParallelConsumerConsumeNanos   metric.IHistogram
 	ParallelConsumerInFlightEvents *metric.Gauge
 
-	// This map and the MaxBehindNanos metric are deprecated in favor of
-	// CheckpointProgress which is stored in the sliMetrics.
+	// This map is deprecated in favor of CheckpointProgress which is stored in
+	// the sliMetrics.
 	mu struct {
 		syncutil.Mutex
 		id       int
 		resolved map[int]hlc.Timestamp
 	}
-	MaxBehindNanos *metric.Gauge
 }
 
 // MetricStruct implements the metric.Struct interface.
@@ -1320,18 +1315,6 @@ func MakeMetrics(histogramWindow time.Duration, lookup *cidr.Lookup) metric.Stru
 
 	m.mu.resolved = make(map[int]hlc.Timestamp)
 	m.mu.id = 1 // start the first id at 1 so we can detect initialization
-	m.MaxBehindNanos = metric.NewFunctionalGauge(metaChangefeedMaxBehindNanos, func() int64 {
-		now := timeutil.Now()
-		var maxBehind time.Duration
-		m.mu.Lock()
-		defer m.mu.Unlock()
-		for _, resolved := range m.mu.resolved {
-			if behind := now.Sub(resolved.GoTime()); behind > maxBehind {
-				maxBehind = behind
-			}
-		}
-		return maxBehind.Nanoseconds()
-	})
 	return m
 }
 
