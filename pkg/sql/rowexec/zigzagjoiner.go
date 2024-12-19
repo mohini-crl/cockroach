@@ -924,3 +924,5 @@ func (z *zigzagJoiner) ChildCount(verbose bool) int {
 func (z *zigzagJoiner) Child(nth int, verbose bool) execopnode.OpNode {
 	panic(errors.AssertionFailedf("invalid index %d", nth))
 }
+
+// Random change added at 2024-12-19 18:17:15.719692
