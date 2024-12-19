@@ -16,9 +16,13 @@ import (
 // cannot be found because it has been deleted by another agent.
 var ErrPartitionNotFound = errors.New("partition not found")
 
-// ErrVectorNotFound is returned by the store when the requested vector cannot
-// be found because it has been deleted in the primary index.
-var ErrVectorNotFound = errors.New("vector not found")
+// ErrRestartOperation is returned by the store when it needs the last index
+// operation (e.g. search or insert) to be restarted. This should only be
+// returned in situations where restarting the operation is guaranteed to make
+// progress, in order to avoid an infinite loop. An example is a stale root
+// partition, where a restarted operation can make progress after the cache has
+// been refreshed.
+var ErrRestartOperation = errors.New("conflict detected, restart operation")
 
 // VectorWithKey contains a original, full-size vector and its referencing key.
 type VectorWithKey struct {
@@ -31,62 +35,76 @@ type VectorWithKey struct {
 	Vector vector.T
 }
 
-// Txn represents the transaction in which store operations run. In production,
-// this would be kv.Txn, but in testing this may be inMemoryTxn.
-type Txn interface{}
-
 // Store encapsulates the component that’s actually storing the vectors, whether
 // that’s in a CRDB cluster for production or in memory for testing and
-// benchmarking. The interface is carefully designed to allow batching of
-// important operations like searching so that the search could be conducted at
-// the remote node, close to the data.
+// benchmarking. Callers can use Store to start and commit transactions against
+// the store that update its structure and contents.
 //
 // Store implementations must be thread-safe. There should typically be only one
 // Store instance in the process for each index.
 type Store interface {
-	// BeginTransaction starts a new transaction in the store to be used for
-	// background fixups like split or merge.
-	BeginTransaction(ctx context.Context) (Txn, error)
+	// Begin creates a new transaction that can be used to read and write the
+	// store in a transactional context.
+	Begin(ctx context.Context) (Txn, error)
 
-	// CommitTransaction commits a transaction previously started by a call to
-	// BeginTransaction.
-	CommitTransaction(ctx context.Context, txn Txn) error
+	// Commit commits a transaction previously started by a call to Begin.
+	Commit(ctx context.Context, txn Txn) error
 
-	// AbortTransaction aborts a transaction previously started by a call to
-	// BeginTransaction.
-	AbortTransaction(ctx context.Context, txn Txn) error
+	// Abort aborts a transaction previously started by a call to Begin.
+	Abort(ctx context.Context, txn Txn) error
 
+	// MergeStats merges recently gathered stats for this process with global
+	// stats if "skipMerge" is false. "stats" is updated with the latest global
+	// stats.
+	MergeStats(ctx context.Context, stats *IndexStats, skipMerge bool) error
+}
+
+// Txn enables callers to make changes to the stored index in a transactional
+// context. Changes might be directly committed to the store or simply buffered
+// up for later commit. Changes might be committed as part of a larger
+// transaction that includes non-vector index changes as well.
+//
+// The interface is carefully designed to allow batching of important operations
+// like searching so that the search could be conducted at remote nodes, close
+// to the data.
+//
+// Txn implementations are not thread-safe.
+type Txn interface {
 	// GetPartition returns the partition identified by the given key, or
 	// ErrPartitionNotFound if the key cannot be found. The returned partition
-	// can be modified by the caller in the scope of the transaction.
-	GetPartition(ctx context.Context, txn Txn, partitionKey PartitionKey) (*Partition, error)
+	// can be modified by the caller in the scope of the transaction with a
+	// guarantee it won't be changed by other agents.
+	GetPartition(ctx context.Context, partitionKey PartitionKey) (*Partition, error)
 
 	// SetRootPartition makes the given partition the root partition in the store.
 	// If the root partition already exists, it is replaced, else it is newly
 	// inserted into the store.
-	SetRootPartition(ctx context.Context, txn Txn, partition *Partition) error
+	SetRootPartition(ctx context.Context, partition *Partition) error
 
 	// InsertPartition inserts the given partition into the store and returns a
 	// new key that identifies it.
-	InsertPartition(ctx context.Context, txn Txn, partition *Partition) (PartitionKey, error)
+	InsertPartition(ctx context.Context, partition *Partition) (PartitionKey, error)
 
 	// DeletePartition deletes the partition with the given key from the store,
 	// or returns ErrPartitionNotFound if the key cannot be found.
-	DeletePartition(ctx context.Context, txn Txn, partitionKey PartitionKey) error
+	DeletePartition(ctx context.Context, partitionKey PartitionKey) error
 
 	// AddToPartition adds the given vector and its associated child key to the
 	// partition with the given key. It returns the count of quantized vectors in
-	// the partition, or ErrPartitionNotFound if the partition cannot be found.
+	// the partition, or ErrPartitionNotFound if the partition cannot be found,
+	// or ErrRestartOperation if the caller should retry the insert operation
+	// that triggered this call.
 	AddToPartition(
-		ctx context.Context, txn Txn, partitionKey PartitionKey, vector vector.T, childKey ChildKey,
+		ctx context.Context, partitionKey PartitionKey, vector vector.T, childKey ChildKey,
 	) (int, error)
 
 	// RemoveFromPartition removes the given vector and its associated child key
 	// from the partition with the given key. It returns the count of quantized
-	// vectors in the partition or ErrPartitionNotFound if the partition cannot
-	// be found.
+	// vectors in the partition, or ErrPartitionNotFound if the partition cannot
+	// be found, or ErrRestartOperation if the caller should retry the delete
+	// operation that triggered this call.
 	RemoveFromPartition(
-		ctx context.Context, txn Txn, partitionKey PartitionKey, childKey ChildKey,
+		ctx context.Context, partitionKey PartitionKey, childKey ChildKey,
 	) (int, error)
 
 	// SearchPartitions finds vectors that are closest to the given query vector.
@@ -101,10 +119,10 @@ type Store interface {
 	// or merged.
 	//
 	// If one or more partitions cannot be found, SearchPartitions returns
-	// ErrPartitionNotFound.
+	// ErrPartitionNotFound, or ErrRestartOperation if the caller should retry
+	// the search operation that triggered this call.
 	SearchPartitions(
 		ctx context.Context,
-		txn Txn,
 		partitionKey []PartitionKey,
 		queryVector vector.T,
 		searchSet *SearchSet,
@@ -115,10 +133,5 @@ type Store interface {
 	// by the given child keys and stores them in "refs". If a vector has been
 	// deleted, then its corresponding reference will be set to nil. If a
 	// partition cannot be found, GetFullVectors returns ErrPartitionNotFound.
-	GetFullVectors(ctx context.Context, txn Txn, refs []VectorWithKey) error
-
-	// MergeStats merges recently gathered stats for this process with global
-	// stats if "skipMerge" is false. "stats" is updated with the latest global
-	// stats.
-	MergeStats(ctx context.Context, stats *IndexStats, skipMerge bool) error
+	GetFullVectors(ctx context.Context, refs []VectorWithKey) error
 }

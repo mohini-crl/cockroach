@@ -172,7 +172,7 @@
 /pkg/cli/testutils.go        @cockroachdb/test-eng
 /pkg/cli/tsdump*.go          @cockroachdb/obs-prs @cockroachdb/obs-india-prs
 /pkg/cli/userfile.go         @cockroachdb/disaster-recovery
-/pkg/cli/workload*           @cockroachdb/sql-foundations
+/pkg/cli/workload*           @cockroachdb/test-eng
 /pkg/cli/zip*.go             @cockroachdb/obs-prs    @cockroachdb/cli-prs @cockroachdb/obs-india-prs
 
 # Beware to not assign the entire server package directory to a single
@@ -254,11 +254,12 @@
 /pkg/crosscluster/       @cockroachdb/disaster-recovery
 /pkg/backup/          @cockroachdb/disaster-recovery
 /pkg//backup/*_job.go  @cockroachdb/disaster-recovery @cockroachdb/jobs-prs
-/pkg/ccl/revertccl/          @cockroachdb/disaster-recovery
+/pkg/revert/          @cockroachdb/disaster-recovery
 /pkg/ccl/storageccl/         @cockroachdb/disaster-recovery
 /pkg/ccl/cloudccl/           @cockroachdb/disaster-recovery
 /pkg/cloud/                  @cockroachdb/disaster-recovery
 /pkg/sql/distsql_plan_bulk*  @cockroachdb/disaster-recovery
+/pkg/sql/catalog/externalcatalog            @cockroachdb/disaster-recovery
 
 /pkg/geo/                    @cockroachdb/spatial
 
@@ -421,7 +422,7 @@
 #!/pkg/ccl/testutilsccl/     @cockroachdb/test-eng-noreview
 /pkg/ccl/testutilsccl/alter_* @cockroachdb/sql-foundations
 #!/pkg/ccl/utilccl/          @cockroachdb/unowned
-/pkg/ccl/workloadccl/        @cockroachdb/test-eng #! @cockroachdb/sql-foundations-noreview
+/pkg/ccl/workloadccl/        @cockroachdb/test-eng
 /pkg/ccl/benchccl/rttanalysisccl/     @cockroachdb/sql-foundations
 #!/pkg/clusterversion/       @cockroachdb/dev-inf-noreview  @cockroachdb/kv-prs-noreview @cockroachdb/test-eng-prs
 /pkg/clusterversion/cockroach_versions.go @cockroachdb/release-eng-prs @cockroachdb/upgrade-prs
@@ -468,28 +469,44 @@
 /pkg/cmd/roachprod/          @cockroachdb/test-eng
 /pkg/cmd/roachprod-microbench/ @cockroachdb/test-eng
 /pkg/cmd/roachprod-stress/   @cockroachdb/test-eng
-/pkg/cmd/roachtest/          @cockroachdb/test-eng
-/pkg/cmd/roachtest/tests/activerecord.go  @cockroachdb/test-eng @cockroachdb/docs-infra-prs
-/pkg/cmd/roachtest/tests/asyncpg.go       @cockroachdb/test-eng @cockroachdb/docs-infra-prs
-/pkg/cmd/roachtest/tests/django.go        @cockroachdb/test-eng @cockroachdb/docs-infra-prs
-/pkg/cmd/roachtest/tests/gopg.go	        @cockroachdb/test-eng @cockroachdb/docs-infra-prs
-/pkg/cmd/roachtest/tests/gorm.go	        @cockroachdb/test-eng @cockroachdb/docs-infra-prs
-/pkg/cmd/roachtest/tests/hibernate.go	    @cockroachdb/test-eng @cockroachdb/docs-infra-prs
-/pkg/cmd/roachtest/tests/knex.go	        @cockroachdb/test-eng @cockroachdb/docs-infra-prs
-/pkg/cmd/roachtest/tests/libpq.go	        @cockroachdb/test-eng @cockroachdb/docs-infra-prs
-/pkg/cmd/roachtest/tests/npgsql.go	      @cockroachdb/test-eng @cockroachdb/docs-infra-prs
-/pkg/cmd/roachtest/tests/pgjdbc.go	      @cockroachdb/test-eng @cockroachdb/docs-infra-prs
-/pkg/cmd/roachtest/tests/pgx.go	          @cockroachdb/test-eng @cockroachdb/docs-infra-prs
-/pkg/cmd/roachtest/tests/ruby_pg.go	      @cockroachdb/test-eng @cockroachdb/docs-infra-prs
-/pkg/cmd/roachtest/tests/sequelize.go	    @cockroachdb/test-eng @cockroachdb/docs-infra-prs
-/pkg/cmd/roachtest/tests/typeorm.go	      @cockroachdb/test-eng @cockroachdb/docs-infra-prs
-/pkg/cmd/label-merged-pr/    @cockroachdb/dev-inf
+#!/pkg/cmd/roachtest/          @cockroachdb/test-eng-noreview
+/pkg/cmd/roachtest/*.go               @cockroachdb/test-eng
+/pkg/cmd/roachtest/cluster/           @cockroachdb/test-eng
+/pkg/cmd/roachtest/clusterstats/      @cockroachdb/test-eng
+/pkg/cmd/roachtest/grafana/           @cockroachdb/test-eng
+/pkg/cmd/roachtest/fixtures/          @cockroachdb/test-eng
+# TODO: should be owned by DRP team
+/pkg/cmd/roachtest/operation/         @cockroachdb/test-eng
+/pkg/cmd/roachtest/operations/        @cockroachdb/test-eng
+/pkg/cmd/roachtest/option/            @cockroachdb/test-eng
+/pkg/cmd/roachtest/registry/          @cockroachdb/test-eng
+/pkg/cmd/roachtest/roachtestflags     @cockroachdb/test-eng
+/pkg/cmd/roachtest/roachtestutil/     @cockroachdb/test-eng
+/pkg/cmd/roachtest/spec/              @cockroachdb/test-eng
+/pkg/cmd/roachtest/test/              @cockroachdb/test-eng
+/pkg/cmd/roachtest/testdata/          @cockroachdb/test-eng
+/pkg/cmd/roachtest/testselector/      @cockroachdb/test-eng
 # This isn't quite right, each file should ideally be owned
 # by a team (or at least most of them), namely the team that
 # is the Owner for the roachtest, but until we unify these
 # two concepts of ownership we don't want to ping test-eng
 # on each test change.
 #!/pkg/cmd/roachtest/tests     @cockroachdb/test-eng-noreview
+/pkg/cmd/roachtest/tests/activerecord.go  @cockroachdb/sql-foundations @cockroachdb/docs-infra-prs
+/pkg/cmd/roachtest/tests/asyncpg.go       @cockroachdb/sql-foundations @cockroachdb/docs-infra-prs
+/pkg/cmd/roachtest/tests/django.go        @cockroachdb/sql-foundations @cockroachdb/docs-infra-prs
+/pkg/cmd/roachtest/tests/gopg.go	        @cockroachdb/sql-foundations @cockroachdb/docs-infra-prs
+/pkg/cmd/roachtest/tests/gorm.go	        @cockroachdb/sql-foundations @cockroachdb/docs-infra-prs
+/pkg/cmd/roachtest/tests/hibernate.go	    @cockroachdb/sql-foundations @cockroachdb/docs-infra-prs
+/pkg/cmd/roachtest/tests/knex.go	        @cockroachdb/sql-foundations @cockroachdb/docs-infra-prs
+/pkg/cmd/roachtest/tests/libpq.go	        @cockroachdb/sql-foundations @cockroachdb/docs-infra-prs
+/pkg/cmd/roachtest/tests/npgsql.go	      @cockroachdb/sql-foundations @cockroachdb/docs-infra-prs
+/pkg/cmd/roachtest/tests/pgjdbc.go	      @cockroachdb/sql-foundations @cockroachdb/docs-infra-prs
+/pkg/cmd/roachtest/tests/pgx.go	          @cockroachdb/sql-foundations @cockroachdb/docs-infra-prs
+/pkg/cmd/roachtest/tests/ruby_pg.go	      @cockroachdb/sql-foundations @cockroachdb/docs-infra-prs
+/pkg/cmd/roachtest/tests/sequelize.go	    @cockroachdb/sql-foundations @cockroachdb/docs-infra-prs
+/pkg/cmd/roachtest/tests/typeorm.go	      @cockroachdb/sql-foundations @cockroachdb/docs-infra-prs
+/pkg/cmd/label-merged-pr/    @cockroachdb/dev-inf
 /pkg/cmd/roachvet/           @cockroachdb/dev-inf
 /pkg/cmd/skip-test/          @cockroachdb/test-eng
 /pkg/cmd/skiperrs/           @cockroachdb/sql-foundations
@@ -502,7 +519,7 @@
 /pkg/cmd/uptodate/           @cockroachdb/dev-inf
 #!/pkg/cmd/urlcheck/           @cockroachdb/docs-infra-prs
 /pkg/cmd/whoownsit/          @cockroachdb/test-eng
-/pkg/cmd/workload/           @cockroachdb/test-eng #! @cockroachdb/sql-foundations-noreview
+/pkg/cmd/workload/           @cockroachdb/test-eng
 #!/pkg/cmd/wraprules/          @cockroachdb/obs-prs-noreview
 #!/pkg/cmd/zerosum/            @cockroachdb/kv-noreview
 /pkg/col/                    @cockroachdb/sql-queries-prs
@@ -585,7 +602,7 @@
 /pkg/util/schedulerlatency/  @cockroachdb/admission-control
 /pkg/util/stop/              @cockroachdb/kv-prs
 /pkg/util/tracing            @cockroachdb/obs-prs @cockroachdb/obs-india-prs
-/pkg/workload/               @cockroachdb/test-eng #! @cockroachdb/sql-foundations-noreview
+/pkg/workload/               @cockroachdb/test-eng
 /pkg/obs/                    @cockroachdb/obs-prs
 /pkg/ccl/auditloggingccl     @cockroachdb/obs-prs
 /pkg/cmd/drt*                @cockroachdb/test-eng

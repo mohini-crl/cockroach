@@ -8,7 +8,6 @@ package kvserver
 import (
 	"context"
 	"fmt"
-	"runtime/debug"
 	"sync/atomic"
 	"time"
 
@@ -24,6 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage/disk"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/storage/fs"
+	"github.com/cockroachdb/cockroach/pkg/util/debugutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/metric/aggmetric"
@@ -3004,7 +3004,7 @@ type tenantMetricsRef struct {
 	// in assertions on failure.
 	_stack struct {
 		syncutil.Mutex
-		string
+		debugutil.SafeStack
 	}
 }
 
@@ -3012,7 +3012,7 @@ func (ref *tenantMetricsRef) assert(ctx context.Context) {
 	if atomic.LoadInt32(&ref._state) != 0 {
 		ref._stack.Lock()
 		defer ref._stack.Unlock()
-		log.FatalfDepth(ctx, 1, "tenantMetricsRef already finalized in:\n%s", ref._stack.string)
+		log.FatalfDepth(ctx, 1, "tenantMetricsRef already finalized in:\n%s", ref._stack.SafeStack)
 	}
 }
 
@@ -3162,7 +3162,7 @@ func (sm *TenantsStorageMetrics) releaseTenant(ctx context.Context, ref *tenantM
 		return          // unreachable
 	}
 	ref._stack.Lock()
-	ref._stack.string = string(debug.Stack())
+	ref._stack.SafeStack = debugutil.Stack()
 	ref._stack.Unlock()
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -3841,7 +3841,7 @@ func (sm *StoreMetrics) updateEngineMetrics(m storage.Metrics) {
 	compactedRead, compactedWritten := m.CompactedBytes()
 	sm.RdbCompactedBytesRead.Update(int64(compactedRead))
 	sm.RdbCompactedBytesWritten.Update(int64(compactedWritten))
-	sm.RdbTableReadersMemEstimate.Update(m.TableCache.Size)
+	sm.RdbTableReadersMemEstimate.Update(m.FileCache.Size)
 	sm.RdbReadAmplification.Update(int64(m.ReadAmp()))
 	sm.RdbPendingCompaction.Update(int64(m.Compact.EstimatedDebt))
 	sm.RdbMarkedForCompactionFiles.Update(int64(m.Compact.MarkedFiles))

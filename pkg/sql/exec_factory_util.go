@@ -57,6 +57,8 @@ func constructPlan(
 				out.execMode = rowexec.SubqueryExecModeAllRowsNormalized
 			case exec.SubqueryAllRows:
 				out.execMode = rowexec.SubqueryExecModeAllRows
+			case exec.SubqueryDiscardAllRows:
+				out.execMode = rowexec.SubqueryExecModeDiscardAllRows
 			default:
 				return nil, errors.Errorf("invalid SubqueryMode %d", in.Mode)
 			}
@@ -299,7 +301,7 @@ func constructVirtualScan(
 	// Virtual indexes never provide a legitimate ordering, so we have to make
 	// sure to sort if we have a required ordering.
 	if len(reqOrdering) != 0 {
-		n, err = ef.ConstructSort(n, reqOrdering, 0)
+		n, err = ef.ConstructSort(n, reqOrdering, 0 /* alreadyOrderedPrefix */, 0 /* estimatedInputRowCount */)
 		if err != nil {
 			return nil, err
 		}

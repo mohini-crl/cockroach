@@ -372,6 +372,7 @@ func testStoreConfig(clock *hlc.Clock, version roachpb.Version) StoreConfig {
 		),
 		KVFlowAdmittedPiggybacker:    node_rac2.NewAdmittedPiggybacker(),
 		KVFlowStreamTokenProvider:    rac2.NewStreamTokenCounterProvider(st, clock),
+		KVFlowWaitForEvalConfig:      rac2.NewWaitForEvalConfig(st),
 		KVFlowEvalWaitMetrics:        rac2.NewEvalWaitMetrics(),
 		KVFlowRangeControllerMetrics: rac2.NewRangeControllerMetrics(),
 	}
@@ -1546,9 +1547,20 @@ func NewStore(
 	s.replRankingsByTenant = NewReplicaRankingsMap()
 
 	s.raftRecvQueues.mon = mon.NewUnlimitedMonitor(ctx, mon.Options{
-		Name:     "raft-receive-queue",
+		Name:     mon.MakeMonitorName("raft-receive-queue"),
 		CurCount: s.metrics.RaftRcvdQueuedBytes,
 		Settings: cfg.Settings,
+	})
+	s.cfg.KVFlowWaitForEvalConfig.RegisterWatcher(func(wc rac2.WaitForEvalCategory) {
+		// When the system is configured with rac2.AllWorkWaitsForEval, RACv2 is
+		// running in a mode where all senders are using send token pools for all
+		// messages to pace sending to a receiving store. These send token pools
+		// are stricter than per range limits. Additionally, these are byte sized
+		// pools, which is a better way to protect the receiver than a count
+		// limit. Hence, we turn off maxLen enforcement in that case, since it is
+		// unnecessary extra protection, and to respect this on the sender side
+		// (in RACv2 code) would result in unnecessary code complexity.
+		s.raftRecvQueues.SetEnforceMaxLen(wc != rac2.AllWorkWaitsForEval)
 	})
 
 	s.cfg.RangeLogWriter = newWrappedRangeLogWriter(
@@ -1579,6 +1591,7 @@ func NewStore(
 		(*racV2Scheduler)(s.scheduler),
 		s.cfg.KVFlowSendTokenWatcher,
 		s.cfg.KVFlowWaitForEvalConfig,
+		s.cfg.RaftMaxInflightBytes,
 		s.TestingKnobs().FlowControlTestingKnobs,
 	)
 
@@ -2325,15 +2338,16 @@ func (s *Store) Start(ctx context.Context, stopper *stop.Stopper) error {
 			return errors.AssertionFailedf("no tenantID for initialized replica %s", rep)
 		}
 
-		// Eagerly unquiesce replicas that use expiration-based leases. We don't
-		// quiesce ranges with expiration leases, and we want to eagerly acquire
-		// leases for them, which happens during Raft ticks. We rely on Raft
-		// pre-vote to avoid disturbing established Raft leaders.
+		// Eagerly unquiece replicas that are using a lease that doesn't support quiescnce.
+		// In practice, this means we'll unquiesce ranges that are using leader leases
+		// or expiration leases. We want to eagerly establish raft leaders for such
+		// ranges and acquire leases on top of this. This happens during Raft ticks.
+		// We rely on Raft pre-vote to avoid disturbance to Raft leaders.
 		//
 		// NB: cluster settings haven't propagated yet, so we have to check the last
-		// known lease instead of relying on shouldUseExpirationLeaseRLocked(). We
-		// also check Sequence > 0 to omit ranges that haven't seen a lease yet.
-		if l, _ := rep.GetLease(); l.Type() == roachpb.LeaseExpiration && l.Sequence > 0 {
+		// known lease instead of desiredLeaseTypeRLocked. We also check Sequence >
+		// 0 to omit ranges that haven't seen a lease yet.
+		if l, _ := rep.GetLease(); !l.SupportsQuiescence() && l.Sequence > 0 {
 			rep.maybeUnquiesce(ctx, true /* wakeLeader */, true /* mayCampaign */)
 		}
 	}

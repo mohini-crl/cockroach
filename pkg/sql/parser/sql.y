@@ -66,6 +66,11 @@ func setErr(sqllex sqlLexer, err error) int {
     return 1
 }
 
+func setErrNoDetails(sqllex sqlLexer, err error) int {
+    sqllex.(*lexer).setErrNoDetails(err)
+    return 1
+}
+
 func unimplementedWithIssue(sqllex sqlLexer, issue int) int {
     sqllex.(*lexer).UnimplementedWithIssue(issue)
     return 1
@@ -989,7 +994,7 @@ func (u *sqlSymUnion) triggerForEach() tree.TriggerForEach {
 %token <str> LABEL LANGUAGE LAST LATERAL LATEST LC_CTYPE LC_COLLATE
 %token <str> LEADING LEASE LEAST LEAKPROOF LEFT LESS LEVEL LIKE LIMIT
 %token <str> LINESTRING LINESTRINGM LINESTRINGZ LINESTRINGZM
-%token <str> LIST LOCAL LOCALITY LOCALTIME LOCALTIMESTAMP LOCKED LOGICAL LOGIN LOOKUP LOW LSHIFT
+%token <str> LIST LOCAL LOCALITY LOCALTIME LOCALTIMESTAMP LOCKED LOGICAL LOGICALLY LOGIN LOOKUP LOW LSHIFT
 
 %token <str> MATCH MATERIALIZED MERGE MINVALUE MAXVALUE METHOD MINUTE MODIFYCLUSTERSETTING MODIFYSQLCLUSTERSETTING MODE MONTH MOVE
 %token <str> MULTILINESTRING MULTILINESTRINGM MULTILINESTRINGZ MULTILINESTRINGZM
@@ -1008,14 +1013,14 @@ func (u *sqlSymUnion) triggerForEach() tree.TriggerForEach {
 
 %token <str> PARALLEL PARENT PARTIAL PARTITION PARTITIONS PASSWORD PAUSE PAUSED PER PHYSICAL PLACEMENT PLACING
 %token <str> PLAN PLANS POINT POINTM POINTZ POINTZM POLYGON POLYGONM POLYGONZ POLYGONZM
-%token <str> POSITION PRECEDING PRECISION PREPARE PRESERVE PRIMARY PRIOR PRIORITY PRIVILEGES
+%token <str> POSITION PRECEDING PRECISION PREPARE PREPARED PRESERVE PRIMARY PRIOR PRIORITY PRIVILEGES
 %token <str> PROCEDURAL PROCEDURE PROCEDURES PUBLIC PUBLICATION
 
 %token <str> QUERIES QUERY QUOTE
 
 %token <str> RANGE RANGES READ REAL REASON REASSIGN RECURSIVE RECURRING REDACT REF REFERENCES REFERENCING REFRESH
 %token <str> REGCLASS REGION REGIONAL REGIONS REGNAMESPACE REGPROC REGPROCEDURE REGROLE REGTYPE REINDEX
-%token <str> RELATIVE RELOCATE REMOVE_PATH REMOVE_REGIONS RENAME REPEATABLE REPLACE REPLICATION
+%token <str> RELATIVE RELOCATE REMOVE_PATH REMOVE_REGIONS RENAME REPEATABLE REPLACE REPLICATED REPLICATION
 %token <str> RELEASE RESET RESTART RESTORE RESTRICT RESTRICTED RESUME RETENTION RETURNING RETURN RETURNS RETRY REVISION_HISTORY
 %token <str> REVOKE RIGHT ROLE ROLES ROLLBACK ROLLUP ROUTINES ROW ROWS RSHIFT RULE RUNNING
 
@@ -1293,6 +1298,9 @@ func (u *sqlSymUnion) triggerForEach() tree.TriggerForEach {
 %type <tree.Statement> abort_stmt
 %type <tree.Statement> rollback_stmt
 %type <tree.Statement> savepoint_stmt
+%type <tree.Statement> prepare_transaction_stmt
+%type <tree.Statement> commit_prepared_stmt
+%type <tree.Statement> rollback_prepared_stmt
 
 %type <tree.Statement> preparable_set_stmt nonpreparable_set_stmt
 %type <tree.Statement> set_local_stmt
@@ -1722,10 +1730,11 @@ func (u *sqlSymUnion) triggerForEach() tree.TriggerForEach {
 %type <privilege.TargetObjectType> target_object_type
 
 // Routine (UDF/SP) relevant components.
-%type <bool> opt_or_replace opt_return_table opt_return_set opt_no
+%type <bool> opt_or_replace opt_return_set opt_no
 %type <str> param_name routine_as
-%type <tree.RoutineParams> opt_routine_param_with_default_list routine_param_with_default_list func_params func_params_list
-%type <tree.RoutineParam> routine_param_with_default routine_param
+%type <tree.RoutineParams> opt_routine_param_with_default_list routine_param_with_default_list
+%type <tree.RoutineParams> func_params func_params_list table_func_column_list
+%type <tree.RoutineParam> routine_param_with_default routine_param table_func_column
 %type <tree.ResolvableTypeReference> routine_return_type routine_param_type
 %type <tree.RoutineOptions> opt_create_routine_opt_list create_routine_opt_list alter_func_opt_list
 %type <tree.RoutineOption> create_routine_opt_item common_routine_opt_item
@@ -4618,6 +4627,16 @@ create_logical_replication_stream_stmt:
       Options: *$11.logicalReplicationOptions(),
     }
   }
+| CREATE LOGICALLY REPLICATED logical_replication_resources FROM logical_replication_resources ON string_or_placeholder opt_logical_replication_options
+  {
+    $$.val = &tree.CreateLogicalReplicationStream{
+      Into: $4.logicalReplicationResources(),
+      From: $6.logicalReplicationResources(),
+      PGURL: $8.expr(),
+      CreateTable: true,
+      Options: *$9.logicalReplicationOptions(),
+    } 
+  }
 | CREATE LOGICAL REPLICATION STREAM error // SHOW HELP: CREATE LOGICAL REPLICATION STREAM
 
 logical_replication_resources:
@@ -4856,8 +4875,7 @@ create_extension_stmt:
 // %SeeAlso: WEBDOCS/create-function.html
 create_func_stmt:
   CREATE opt_or_replace FUNCTION routine_create_name '(' opt_routine_param_with_default_list ')'
-  RETURNS opt_return_table opt_return_set routine_return_type
-  opt_create_routine_opt_list opt_routine_body
+  RETURNS opt_return_set routine_return_type opt_create_routine_opt_list opt_routine_body
   {
     name := $4.unresolvedObjectName().ToRoutineName()
     $$.val = &tree.CreateRoutine{
@@ -4866,11 +4884,43 @@ create_func_stmt:
       Name: name,
       Params: $6.routineParams(),
       ReturnType: &tree.RoutineReturnType{
-        Type: $11.typeReference(),
-        SetOf: $10.bool(),
+        Type: $10.typeReference(),
+        SetOf: $9.bool(),
       },
-      Options: $12.routineOptions(),
-      RoutineBody: $13.routineBody(),
+      Options: $11.routineOptions(),
+      RoutineBody: $12.routineBody(),
+    }
+  }
+| CREATE opt_or_replace FUNCTION routine_create_name '(' opt_routine_param_with_default_list ')'
+  RETURNS TABLE '(' table_func_column_list ')' opt_create_routine_opt_list opt_routine_body
+  {
+    // RETURNS TABLE is syntactic sugar for RETURNS SETOF with:
+    // - RECORD if there are multiple TABLE parameters, or
+    // - the type of the single TABLE parameter.
+    // The TABLE parameters are added to the list of routine parameters.
+    tableParams := $11.routineParams()
+    returnType := tree.ResolvableTypeReference(types.AnyTuple)
+    if len(tableParams) == 1 {
+      returnType = tableParams[0].Type
+    }
+    routineParams := $6.routineParams()
+    for i := range routineParams {
+      // OUT parameters are not allowed in table functions.
+      if tree.IsOutParamClass(routineParams[i].Class) {
+        return setErrNoDetails(sqllex, errors.New("OUT and INOUT arguments aren't allowed in TABLE functions"))
+      }
+    }
+    $$.val = &tree.CreateRoutine{
+      IsProcedure: false,
+      Replace: $2.bool(),
+      Name: $4.unresolvedObjectName().ToRoutineName(),
+      Params: append(routineParams, tableParams...),
+      ReturnType: &tree.RoutineReturnType{
+        Type: returnType,
+        SetOf: true,
+      },
+      Options: $13.routineOptions(),
+      RoutineBody: $14.routineBody(),
     }
   }
 | CREATE opt_or_replace FUNCTION routine_create_name '(' opt_routine_param_with_default_list ')'
@@ -4917,10 +4967,6 @@ create_proc_stmt:
 
 opt_or_replace:
   OR REPLACE { $$.val = true }
-| /* EMPTY */ { $$.val = false }
-
-opt_return_table:
-  TABLE { return unimplementedWithIssueDetail(sqllex, 100226, "UDF returning TABLE") }
 | /* EMPTY */ { $$.val = false }
 
 opt_return_set:
@@ -5008,6 +5054,25 @@ routine_param_type:
 
 routine_return_type:
   routine_param_type
+
+table_func_column: param_name routine_param_type
+  {
+    $$.val = tree.RoutineParam{
+      Name: tree.Name($1),
+      Type: $2.typeReference(),
+      Class: tree.RoutineParamOut,
+    }
+  }
+
+table_func_column_list:
+  table_func_column
+  {
+    $$.val = tree.RoutineParams{$1.routineParam()}
+  }
+| table_func_column_list ',' table_func_column
+  {
+    $$.val = append($1.routineParams(), $3.routineParam())
+  }
 
 opt_create_routine_opt_list:
   create_routine_opt_list { $$.val = $1.routineOptions() }
@@ -12491,12 +12556,15 @@ savepoint_stmt:
   }
 | SAVEPOINT error // SHOW HELP: SAVEPOINT
 
-// BEGIN / START / COMMIT / END / ROLLBACK / ...
+// BEGIN / START / COMMIT / END / ROLLBACK / PREPARE TRANSACTION / COMMIT PREPARED / ROLLBACK PREPARED / ...
 transaction_stmt:
-  begin_stmt    // EXTEND WITH HELP: BEGIN
-| commit_stmt   // EXTEND WITH HELP: COMMIT
-| rollback_stmt // EXTEND WITH HELP: ROLLBACK
-| abort_stmt    /* SKIP DOC */
+  begin_stmt               // EXTEND WITH HELP: BEGIN
+| commit_stmt              // EXTEND WITH HELP: COMMIT
+| rollback_stmt            // EXTEND WITH HELP: ROLLBACK
+| abort_stmt               /* SKIP DOC */
+| prepare_transaction_stmt // EXTEND WITH HELP: PREPARE TRANSACTION
+| commit_prepared_stmt     // EXTEND WITH HELP: COMMIT PREPARED
+| rollback_prepared_stmt   // EXTEND WITH HELP: ROLLBACK PREPARED
 
 // %Help: BEGIN - start a transaction
 // %Category: Txn
@@ -12631,7 +12699,6 @@ opt_comma:
 transaction_mode:
   transaction_iso_level
   {
-    /* SKIP DOC */
     $$.val = tree.TransactionModes{Isolation: $1.isoLevel()}
   }
 | transaction_user_priority
@@ -12681,6 +12748,36 @@ transaction_deferrable_mode:
 | NOT DEFERRABLE
   {
     $$.val = tree.NotDeferrable
+  }
+
+// %Help: PREPARE TRANSACTION - prepare the current transaction for two-phase commit
+// %Category: Txn
+// %Text: PREPARE TRANSACTION <transaction-id>
+// %SeeAlso: COMMIT PREPARED, ROLLBACK PREPARED
+prepare_transaction_stmt:
+  PREPARE TRANSACTION SCONST
+  {
+    $$.val = &tree.PrepareTransaction{Transaction: tree.NewStrVal($3)}
+  }
+
+// %Help: COMMIT PREPARED - commit the named transaction as part of two-phase commit
+// %Category: Txn
+// %Text: COMMIT PREPARED <transaction-id>
+// %SeeAlso: PREPARE TRANSACTION, ROLLBACK PREPARED
+commit_prepared_stmt:
+  COMMIT PREPARED SCONST
+  {
+    $$.val = &tree.CommitPrepared{Transaction: tree.NewStrVal($3)}
+  }
+
+// %Help: ROLLBACK PREPARED - rollback the named transaction as part of two-phase commit
+// %Category: Txn
+// %Text: ROLLBACK PREPARED <transaction-id>
+// %SeeAlso: PREPARE TRANSACTION, COMMIT PREPARED
+rollback_prepared_stmt:
+  ROLLBACK PREPARED SCONST
+  {
+    $$.val = &tree.RollbackPrepared{Transaction: tree.NewStrVal($3)}
   }
 
 // %Help: CREATE DATABASE - create a new database
@@ -17658,6 +17755,7 @@ unreserved_keyword:
 | LOCAL
 | LOCKED
 | LOGICAL
+| LOGICALLY
 | LOGIN
 | LOCALITY
 | LOOKUP
@@ -17753,6 +17851,7 @@ unreserved_keyword:
 | POLYGONZM
 | PRECEDING
 | PREPARE
+| PREPARED
 | PRESERVE
 | PRIOR
 | PRIORITY
@@ -17786,6 +17885,7 @@ unreserved_keyword:
 | RENAME
 | REPEATABLE
 | REPLACE
+| REPLICATED
 | REPLICATION
 | RESET
 | RESTART
@@ -18216,6 +18316,7 @@ bare_label_keywords:
 | LOCALTIMESTAMP
 | LOCKED
 | LOGICAL
+| LOGICALLY
 | LOGIN
 | LOOKUP
 | LOW
@@ -18321,6 +18422,7 @@ bare_label_keywords:
 | POSITION
 | PRECEDING
 | PREPARE
+| PREPARED
 | PRESERVE
 | PRIMARY
 | PRIOR
@@ -18357,6 +18459,7 @@ bare_label_keywords:
 | RENAME
 | REPEATABLE
 | REPLACE
+| REPLICATED
 | REPLICATION
 | RESET
 | RESTART

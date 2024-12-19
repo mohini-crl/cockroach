@@ -1185,7 +1185,6 @@ func (b *Builder) buildApplyJoin(join memo.RelExpr) (_ execPlan, outputCols colO
 
 		// Copy the right expression into a new memo, replacing each bound column
 		// with the corresponding value from the left row.
-		addedWithBindings := false
 		var replaceFn norm.ReplaceFunc
 		replaceFn = func(e opt.Expr) opt.Expr {
 			switch t := e.(type) {
@@ -1209,12 +1208,15 @@ func (b *Builder) buildApplyJoin(join memo.RelExpr) (_ execPlan, outputCols colO
 				// We lazily add these With expressions to the metadata here
 				// because the call to Factory.CopyAndReplace below clears With
 				// expressions in the metadata.
-				if !addedWithBindings {
-					b.mem.Metadata().ForEachWithBinding(func(id opt.WithID, expr opt.Expr) {
+				b.mem.Metadata().ForEachWithBinding(func(id opt.WithID, expr opt.Expr) {
+					// Make sure to check for an existing With binding, since we may
+					// have already rewritten the bound expression and added it to the
+					// new memo if the associated WithExpr is part of the right input of
+					// the apply-join.
+					if !f.Metadata().HasWithBinding(id) {
 						f.Metadata().AddWithBinding(id, expr)
-					})
-					addedWithBindings = true
-				}
+					}
+				})
 				// Fall through.
 			}
 			return f.CopyAndReplaceDefault(e, replaceFn)
@@ -1702,7 +1704,12 @@ func (b *Builder) buildGroupBy(groupBy memo.RelExpr) (_ execPlan, outputCols col
 
 	var ep execPlan
 	if groupBy.Op() == opt.ScalarGroupByOp {
-		ep.root, err = b.factory.ConstructScalarGroupBy(input.root, aggInfos)
+		scalarGroupBy := groupBy.(*memo.ScalarGroupByExpr)
+		var inputRowCount uint64
+		if inputRelProps := scalarGroupBy.Input.Relational(); inputRelProps.Statistics().Available {
+			inputRowCount = uint64(math.Ceil(inputRelProps.Statistics().RowCount))
+		}
+		ep.root, err = b.factory.ConstructScalarGroupBy(input.root, aggInfos, inputRowCount)
 	} else {
 		groupBy := groupBy.(*memo.GroupByExpr)
 		var groupingColOrder colinfo.ColumnOrdering
@@ -1718,12 +1725,15 @@ func (b *Builder) buildGroupBy(groupBy memo.RelExpr) (_ execPlan, outputCols col
 			return execPlan{}, colOrdMap{}, err
 		}
 		orderType := exec.GroupingOrderType(groupBy.GroupingOrderType(&groupBy.RequiredPhysical().Ordering))
-		var rowCount uint64
+		var rowCount, inputRowCount uint64
 		if relProps := groupBy.Relational(); relProps.Statistics().Available {
 			rowCount = uint64(math.Ceil(relProps.Statistics().RowCount))
 		}
+		if inputRelProps := groupBy.Input.Relational(); inputRelProps.Statistics().Available {
+			inputRowCount = uint64(math.Ceil(inputRelProps.Statistics().RowCount))
+		}
 		ep.root, err = b.factory.ConstructGroupBy(
-			input.root, groupingColIdx, groupingColOrder, aggInfos, reqOrd, orderType, rowCount,
+			input.root, groupingColIdx, groupingColOrder, aggInfos, reqOrd, orderType, rowCount, inputRowCount,
 		)
 	}
 	if err != nil {
@@ -2018,12 +2028,18 @@ func (b *Builder) buildTopK(e *memo.TopKExpr) (_ execPlan, outputCols colOrdMap,
 	if err != nil {
 		return execPlan{}, colOrdMap{}, err
 	}
+	var inputRowCount uint64
+	if inputRelProps := e.Input.Relational(); inputRelProps.Statistics().Available {
+		inputRowCount = uint64(math.Ceil(inputRelProps.Statistics().RowCount))
+	}
 	var ep execPlan
 	ep.root, err = b.factory.ConstructTopK(
 		input.root,
 		e.K,
 		exec.OutputOrdering(sqlOrdering),
-		alreadyOrderedPrefix)
+		alreadyOrderedPrefix,
+		inputRowCount,
+	)
 	if err != nil {
 		return execPlan{}, colOrdMap{}, err
 	}
@@ -2077,11 +2093,18 @@ func (b *Builder) buildSort(sort *memo.SortExpr) (_ execPlan, outputCols colOrdM
 	if err != nil {
 		return execPlan{}, colOrdMap{}, err
 	}
+
+	var inputRowCount uint64
+	if inputRelProps := sort.Input.Relational(); inputRelProps.Statistics().Available {
+		inputRowCount = uint64(math.Ceil(inputRelProps.Statistics().RowCount))
+	}
+
 	var ep execPlan
 	ep.root, err = b.factory.ConstructSort(
 		input.root,
 		exec.OutputOrdering(sqlOrdering),
 		alreadyOrderedPrefix,
+		inputRowCount,
 	)
 	if err != nil {
 		return execPlan{}, colOrdMap{}, err
@@ -3174,16 +3197,12 @@ func (b *Builder) buildWith(with *memo.WithExpr) (_ execPlan, outputCols colOrdM
 	// remove it, since subquery execution also guarantees complete execution.
 
 	// Add the buffer as a subquery so it gets executed ahead of time, and is
-	// available to be referenced by other queries.
+	// available to be referenced by other queries. Use SubqueryDiscardAllRows to
+	// avoid buffering the results in the subquery, since the bufferNode will
+	// already save the rows.
 	b.subqueries = append(b.subqueries, exec.Subquery{
 		ExprNode: with.OriginalExpr,
-		// TODO(justin): this is wasteful: both the subquery and the bufferNode
-		// will buffer up all the results.  This should be fixed by either making
-		// the buffer point directly to the subquery results or adding a new
-		// subquery mode that reads and discards all rows. This could possibly also
-		// be fixed by ensuring that bufferNode exhausts its input (and forcing it
-		// to behave like a spoolNode) and using the EXISTS mode.
-		Mode:     exec.SubqueryAllRows,
+		Mode:     exec.SubqueryDiscardAllRows,
 		Root:     buffer,
 		RowCount: int64(with.Relational().Statistics().RowCountIfAvailable()),
 	})

@@ -238,9 +238,9 @@ generate the necessary fixtures.
   for the new release.
  
 - [ ] Add `cockroach-go-testserver-...` logictest config for the forked version
-  (e.g. `cockroach-go-testserver-24.1`). Search for all uses of the previous
-  similar configs and enable them for the new version (or add similar tests).
-  Run `./dev gen`.
+  (e.g. `cockroach-go-testserver-24.1`) and add it to
+  `cockroach-go-testserver-configs`. Run `./dev gen` and fix up any tests that
+  need changing.
 
 - [ ] Update releases file:
   ```
@@ -295,7 +295,14 @@ in two PRs.
   </details>
 
 - [ ] Remove logictest configs that involve now-unsupported versions (and run
-  `./dev gen testlogic`).
+  `./dev gen testlogic bazel`).
+
+- [ ] Remove `pkg/sql/catalog/bootstrap` data for now-unsupported versions.
+
+- [ ] Update `pkg/storage.MinimumSupportedFormatVersion` and `storage.pebbleVersionMap`
+
+- [ ] Update `pkg/sql/schemachanger/scplan.rulesForReleases` and remove the
+  defunct package(s) inside `rules`.
 
 - [ ] File issue(s) to remove `TODO_Delete_` uses and simplify related code; assign
   to relevant teams (depending on which top-level packages use such gates).

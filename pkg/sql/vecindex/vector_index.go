@@ -219,16 +219,6 @@ func (vi *VectorIndex) Close() {
 	}
 }
 
-// ProcessFixups waits until all pending fixups have been processed by the
-// background goroutine.
-func (vi *VectorIndex) ProcessFixups() {
-	if vi.cancel == nil {
-		panic(errors.AssertionFailedf(
-			"ProcessFixups cannot be called without a background goroutine running"))
-	}
-	vi.fixups.Wait()
-}
-
 // Insert adds a new vector with the given primary key to the index. This is
 // called within the scope of a transaction so that the index does not appear to
 // change during the insert.
@@ -263,7 +253,7 @@ func (vi *VectorIndex) Insert(
 
 	// Insert the vector into the secondary index.
 	childKey := vecstore.ChildKey{PrimaryKey: key}
-	return vi.insertHelper(&parentSearchCtx, childKey, true /* allowRetry */)
+	return vi.insertHelper(&parentSearchCtx, childKey)
 }
 
 // Delete attempts to remove a vector from the index, given its value and
@@ -304,7 +294,7 @@ func (vi *VectorIndex) Delete(
 	for {
 		searchCtx.Options.BaseBeamSize = baseBeamSize
 
-		err := vi.searchHelper(&searchCtx, &searchSet, true /* allowRetry */)
+		err := vi.searchHelper(&searchCtx, &searchSet)
 		if err != nil {
 			return err
 		}
@@ -320,6 +310,11 @@ func (vi *VectorIndex) Delete(
 
 		// Remove the vector from its partition in the store.
 		_, err = vi.removeFromPartition(ctx, txn, results[0].ParentPartitionKey, results[0].ChildKey)
+		if errors.Is(err, vecstore.ErrRestartOperation) {
+			// If store requested the operation be retried, then re-run the
+			// search and delete.
+			continue
+		}
 		return err
 	}
 }
@@ -349,19 +344,43 @@ func (vi *VectorIndex) Search(
 	vi.quantizer.RandomizeVector(ctx, queryVector, tempRandomized, false /* invert */)
 	searchCtx.Randomized = tempRandomized
 
-	return vi.searchHelper(&searchCtx, searchSet, true /* allowRetry */)
+	return vi.searchHelper(&searchCtx, searchSet)
+}
+
+// ProcessFixups waits until all pending fixups have been processed by the
+// background goroutine.
+func (vi *VectorIndex) ProcessFixups() {
+	if vi.cancel == nil {
+		panic(errors.AssertionFailedf(
+			"ProcessFixups cannot be called without a background goroutine running"))
+	}
+	vi.fixups.Wait()
+}
+
+// ForceSplit enqueues a split fixup. It is used for testing.
+func (vi *VectorIndex) ForceSplit(
+	ctx context.Context, parentPartitionKey vecstore.PartitionKey, partitionKey vecstore.PartitionKey,
+) {
+	vi.fixups.AddSplit(ctx, parentPartitionKey, partitionKey)
+}
+
+// ForceMerge enqueues a merge fixup. It is used for testing.
+func (vi *VectorIndex) ForceMerge(
+	ctx context.Context, parentPartitionKey vecstore.PartitionKey, partitionKey vecstore.PartitionKey,
+) {
+	vi.fixups.AddMerge(ctx, parentPartitionKey, partitionKey)
 }
 
 // insertHelper looks for the best partition in which to add the vector and then
 // adds the vector to that partition.
 func (vi *VectorIndex) insertHelper(
-	parentSearchCtx *searchContext, childKey vecstore.ChildKey, allowRetry bool,
+	parentSearchCtx *searchContext, childKey vecstore.ChildKey,
 ) error {
 	// The partition in which to insert the vector is at the parent level
 	// (level+1). Return enough results to have good candidates for inserting
 	// the vector into another partition.
 	searchSet := vecstore.SearchSet{MaxResults: 1}
-	err := vi.searchHelper(parentSearchCtx, &searchSet, allowRetry)
+	err := vi.searchHelper(parentSearchCtx, &searchSet)
 	if err != nil {
 		return err
 	}
@@ -370,15 +389,8 @@ func (vi *VectorIndex) insertHelper(
 	partitionKey := results[0].ChildKey.PartitionKey
 	_, err = vi.addToPartition(parentSearchCtx.Ctx, parentSearchCtx.Txn, parentPartitionKey,
 		partitionKey, parentSearchCtx.Randomized, childKey)
-	if errors.Is(err, vecstore.ErrPartitionNotFound) {
-		// Retry the insert after root partition cache invalidation.
-		if !allowRetry {
-			// This indicates index corruption, since it should only require a
-			// single retry to handle the case where the root partition is stale.
-			// There should be no other cases that a partition cannot be found.
-			panic(errors.AssertionFailedf("partition cannot be found even though root is not stale"))
-		}
-		return vi.insertHelper(parentSearchCtx, childKey, false /* allowRetry */)
+	if errors.Is(err, vecstore.ErrRestartOperation) {
+		return vi.insertHelper(parentSearchCtx, childKey)
 	} else if err != nil {
 		return err
 	}
@@ -397,7 +409,7 @@ func (vi *VectorIndex) addToPartition(
 	vector vector.T,
 	childKey vecstore.ChildKey,
 ) (int, error) {
-	count, err := vi.store.AddToPartition(ctx, txn, partitionKey, vector, childKey)
+	count, err := txn.AddToPartition(ctx, partitionKey, vector, childKey)
 	if err != nil {
 		return 0, errors.Wrapf(err, "adding vector to partition %d", partitionKey)
 	}
@@ -417,7 +429,7 @@ func (vi *VectorIndex) removeFromPartition(
 	partitionKey vecstore.PartitionKey,
 	childKey vecstore.ChildKey,
 ) (int, error) {
-	count, err := vi.store.RemoveFromPartition(ctx, txn, partitionKey, childKey)
+	count, err := txn.RemoveFromPartition(ctx, partitionKey, childKey)
 	if err != nil {
 		return 0, errors.Wrapf(err, "removing vector from partition %d", partitionKey)
 	}
@@ -436,9 +448,7 @@ func (vi *VectorIndex) removeFromPartition(
 // data vectors are the quantized representation of the original vectors that
 // were inserted into the tree. The original, full-size vectors are fetched from
 // the primary index and used to re-rank candidate search results.
-func (vi *VectorIndex) searchHelper(
-	searchCtx *searchContext, searchSet *vecstore.SearchSet, allowRetry bool,
-) error {
+func (vi *VectorIndex) searchHelper(searchCtx *searchContext, searchSet *vecstore.SearchSet) error {
 	// Return enough search results to:
 	// 1. Ensure that the number of results requested by the caller is respected.
 	// 2. Ensure that there are enough samples for calculating stats.
@@ -569,16 +579,8 @@ func (vi *VectorIndex) searchHelper(
 		// level (leaf-level partitions do not have children).
 		results = results[:min(beamSize, len(results))]
 		_, err = vi.searchChildPartitions(searchCtx, &subSearchSet, results)
-		if errors.Is(err, vecstore.ErrPartitionNotFound) {
-			// The cached root partition must be stale, so retry the search.
-			if !allowRetry {
-				// This indicates index corruption, since it should only require
-				// a single retry to handle the case where the root partition is
-				// stale. There should be no other cases that a partition cannot
-				// be found.
-				panic(errors.AssertionFailedf("partition cannot be found even though root is not stale"))
-			}
-			return vi.searchHelper(searchCtx, searchSet, false /* allowRetry */)
+		if errors.Is(err, vecstore.ErrRestartOperation) {
+			return vi.searchHelper(searchCtx, searchSet)
 		} else if err != nil {
 			return err
 		}
@@ -599,9 +601,8 @@ func (vi *VectorIndex) searchChildPartitions(
 	}
 
 	searchCtx.tempCounts = ensureSliceLen(searchCtx.tempCounts, len(parentResults))
-	level, err = vi.store.SearchPartitions(
-		searchCtx.Ctx, searchCtx.Txn, searchCtx.tempKeys, searchCtx.Randomized,
-		searchSet, searchCtx.tempCounts)
+	level, err = searchCtx.Txn.SearchPartitions(
+		searchCtx.Ctx, searchCtx.tempKeys, searchCtx.Randomized, searchSet, searchCtx.tempCounts)
 	if err != nil {
 		return 0, err
 	}
@@ -715,7 +716,7 @@ func (vi *VectorIndex) getRerankVectors(
 	}
 
 	// The store is expected to fetch the vectors in parallel.
-	err := vi.store.GetFullVectors(searchCtx.Ctx, searchCtx.Txn, searchCtx.tempVectorsWithKeys)
+	err := searchCtx.Txn.GetFullVectors(searchCtx.Ctx, searchCtx.tempVectorsWithKeys)
 	if err != nil {
 		return nil, err
 	}
@@ -821,7 +822,7 @@ func (vi *VectorIndex) Format(
 
 	var helper func(partitionKey vecstore.PartitionKey, parentPrefix string, childPrefix string) error
 	helper = func(partitionKey vecstore.PartitionKey, parentPrefix string, childPrefix string) error {
-		partition, err := vi.store.GetPartition(ctx, txn, partitionKey)
+		partition, err := txn.GetPartition(ctx, partitionKey)
 		if err != nil {
 			return err
 		}
@@ -854,7 +855,7 @@ func (vi *VectorIndex) Format(
 
 			if partition.Level() == vecstore.LeafLevel {
 				refs := []vecstore.VectorWithKey{{Key: childKey}}
-				if err = vi.store.GetFullVectors(ctx, txn, refs); err != nil {
+				if err = txn.GetFullVectors(ctx, refs); err != nil {
 					return err
 				}
 				buf.WriteString(parentPrefix)

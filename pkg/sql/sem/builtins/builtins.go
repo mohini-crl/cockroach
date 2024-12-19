@@ -10130,8 +10130,8 @@ func arrayVariadicBuiltin(impls func(*types.T) []tree.Overload) builtinDefinitio
 	}
 	// Prevent usage in DistSQL because it cannot handle arrays of untyped tuples.
 	tupleOverload := impls(types.AnyTuple)
-	for _, t := range tupleOverload {
-		t.DistsqlBlocklist = true
+	for i := range tupleOverload {
+		tupleOverload[i].DistsqlBlocklist = true
 	}
 	overloads = append(overloads, tupleOverload...)
 	return makeBuiltin(
@@ -11998,8 +11998,8 @@ func makeTimestampStatementBuiltinOverload(withOutputTZ bool, withInputTZ bool) 
 			hour := int(tree.MustBeDInt(args[3]))
 			min := int(tree.MustBeDInt(args[4]))
 			sec := float64(tree.MustBeDFloat(args[5]))
-			truncatedSec := math.Floor(sec)
-			nsec := math.Mod(sec, truncatedSec) * float64(time.Second)
+			truncatedSec, remainderSec := math.Modf(sec)
+			nsec := remainderSec * float64(time.Second)
 			t := time.Date(year, month, day, hour, min, int(truncatedSec), int(nsec), location)
 			if withOutputTZ {
 				return tree.MakeDTimestampTZ(t, time.Microsecond)

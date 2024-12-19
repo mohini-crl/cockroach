@@ -2331,9 +2331,10 @@ func TestStoreRangeMergeConcurrentRequests(t *testing.T) {
 		}
 	}
 
-	// Failures in this test often present as a deadlock. Set a short timeout to
-	// limit the damage.
-	ctx, cancel := context.WithTimeout(ctx, testutils.DefaultSucceedsSoonDuration)
+	// Failures in this test often present as a deadlock.
+	// We have a relatively high timeout since this test flakes in leader leases,
+	// as it keeps withdrawing/granting store liveness support.
+	ctx, cancel := context.WithTimeout(ctx, 3*testutils.DefaultSucceedsSoonDuration)
 	defer cancel()
 
 	const numGetWorkers = 16

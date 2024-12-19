@@ -145,13 +145,6 @@ func TestCCLLogic_fk_read_committed(
 	runCCLLogicTest(t, "fk_read_committed")
 }
 
-func TestCCLLogic_generic(
-	t *testing.T,
-) {
-	defer leaktest.AfterTest(t)()
-	runCCLLogicTest(t, "generic")
-}
-
 func TestCCLLogic_hash_sharded_index_read_committed(
 	t *testing.T,
 ) {
@@ -248,6 +241,13 @@ func TestCCLLogic_plpgsql_call(
 ) {
 	defer leaktest.AfterTest(t)()
 	runCCLLogicTest(t, "plpgsql_call")
+}
+
+func TestCCLLogic_plpgsql_cte(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runCCLLogicTest(t, "plpgsql_cte")
 }
 
 func TestCCLLogic_plpgsql_cursor(

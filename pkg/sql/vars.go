@@ -27,7 +27,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colfetcher"
 	"github.com/cockroachdb/cockroach/pkg/sql/delegate"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
-	"github.com/cockroachdb/cockroach/pkg/sql/gpq"
 	"github.com/cockroachdb/cockroach/pkg/sql/lex"
 	"github.com/cockroachdb/cockroach/pkg/sql/paramparse"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
@@ -634,6 +633,92 @@ var varGen = map[string]sessionVar{
 	},
 
 	// CockroachDB extension.
+	`distribute_group_by_row_count_threshold`: {
+		Get: func(evalCtx *extendedEvalContext, _ *kv.Txn) (string, error) {
+			return strconv.FormatUint(evalCtx.SessionData().DistributeGroupByRowCountThreshold, 10), nil
+		},
+		GetStringVal: makeIntGetStringValFn(`distribute_group_by_row_count_threshold`),
+		Set: func(_ context.Context, m sessionDataMutator, s string) error {
+			i, err := strconv.ParseInt(s, 10, 64)
+			if err != nil {
+				return err
+			}
+			if i < 0 {
+				return pgerror.Newf(pgcode.InvalidParameterValue,
+					"cannot set distribute_group_by_row_count_threshold to a negative value: %d", i)
+			}
+			m.SetDistributeGroupByRowCountThreshold(uint64(i))
+			return nil
+		},
+		GlobalDefault: func(sv *settings.Values) string {
+			return strconv.FormatUint(1000, 10)
+		},
+	},
+
+	// CockroachDB extension.
+	`distribute_sort_row_count_threshold`: {
+		Get: func(evalCtx *extendedEvalContext, _ *kv.Txn) (string, error) {
+			return strconv.FormatUint(evalCtx.SessionData().DistributeSortRowCountThreshold, 10), nil
+		},
+		GetStringVal: makeIntGetStringValFn(`distribute_sort_row_count_threshold`),
+		Set: func(_ context.Context, m sessionDataMutator, s string) error {
+			i, err := strconv.ParseInt(s, 10, 64)
+			if err != nil {
+				return err
+			}
+			if i < 0 {
+				return pgerror.Newf(pgcode.InvalidParameterValue,
+					"cannot set distribute_sort_row_count_threshold to a negative value: %d", i)
+			}
+			m.SetDistributeSortRowCountThreshold(uint64(i))
+			return nil
+		},
+		GlobalDefault: func(sv *settings.Values) string {
+			return strconv.FormatUint(1000, 10)
+		},
+	},
+
+	// CockroachDB extension.
+	`distribute_scan_row_count_threshold`: {
+		Get: func(evalCtx *extendedEvalContext, _ *kv.Txn) (string, error) {
+			return strconv.FormatUint(evalCtx.SessionData().DistributeScanRowCountThreshold, 10), nil
+		},
+		GetStringVal: makeIntGetStringValFn(`distribute_scan_row_count_threshold`),
+		Set: func(_ context.Context, m sessionDataMutator, s string) error {
+			i, err := strconv.ParseInt(s, 10, 64)
+			if err != nil {
+				return err
+			}
+			if i < 0 {
+				return pgerror.Newf(pgcode.InvalidParameterValue,
+					"cannot set distribute_scan_row_count_threshold to a negative value: %d", i)
+			}
+			m.SetDistributeScanRowCountThreshold(uint64(i))
+			return nil
+		},
+		GlobalDefault: func(sv *settings.Values) string {
+			return strconv.FormatUint(10000, 10)
+		},
+	},
+
+	// CockroachDB extension.
+	`always_distribute_full_scans`: {
+		GetStringVal: makePostgresBoolGetStringValFn(`always_distribute_full_scans`),
+		Set: func(_ context.Context, m sessionDataMutator, s string) error {
+			b, err := paramparse.ParseBoolVar("always_distribute_full_scans", s)
+			if err != nil {
+				return err
+			}
+			m.SetAlwaysDistributeFullScans(b)
+			return nil
+		},
+		Get: func(evalCtx *extendedEvalContext, _ *kv.Txn) (string, error) {
+			return formatBoolAsPostgresSetting(evalCtx.SessionData().AlwaysDistributeFullScans), nil
+		},
+		GlobalDefault: globalFalse,
+	},
+
+	// CockroachDB extension.
 	`disable_vec_union_eager_cancellation`: {
 		GetStringVal: makePostgresBoolGetStringValFn(`disable_vec_union_eager_cancellation`),
 		Set: func(_ context.Context, m sessionDataMutator, s string) error {
@@ -1179,6 +1264,10 @@ var varGen = map[string]sessionVar{
 
 	// See https://www.postgresql.org/docs/10/static/runtime-config-preset.html#GUC-MAX-INDEX-KEYS
 	`max_index_keys`: makeReadOnlyVar("32"),
+
+	// Supported for PG compatibility only. MaxInt32 indicates no limit.
+	// See https://www.postgresql.org/docs/10/runtime-config-resource.html#GUC-MAX-PREPARED-TRANSACTIONS
+	`max_prepared_transactions`: makeReadOnlyVar(strconv.Itoa(math.MaxInt32)),
 
 	// CockroachDB extension.
 	`node_id`: {
@@ -3458,12 +3547,6 @@ var varGen = map[string]sessionVar{
 					sessiondatapb.PlanCacheModeAuto.String(),
 				)
 			}
-			if mode == sessiondatapb.PlanCacheModeForceGeneric ||
-				mode == sessiondatapb.PlanCacheModeAuto {
-				if err := gpq.CheckClusterSupportsGenericQueryPlans(m.settings); err != nil {
-					return err
-				}
-			}
 			m.SetPlanCacheMode(mode)
 			return nil
 		},
@@ -3471,7 +3554,7 @@ var varGen = map[string]sessionVar{
 			return evalCtx.SessionData().PlanCacheMode.String(), nil
 		},
 		GlobalDefault: func(sv *settings.Values) string {
-			return sessiondatapb.PlanCacheModeForceCustom.String()
+			return sessiondatapb.PlanCacheModeAuto.String()
 		},
 	},
 

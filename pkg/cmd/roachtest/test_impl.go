@@ -33,10 +33,15 @@ import (
 // each node in the cluster.
 const perfArtifactsDir = "perf"
 
-// goCoverArtifactsDir the directory on cluster nodes in which go coverage
+// goCoverArtifactsDir is the directory on cluster nodes in which go coverage
 // profiles are dumped. At the end of a test this directory is copied into the
 // test's ArtifactsDir() from each node in the cluster.
 const goCoverArtifactsDir = "gocover"
+
+// cpuProfilesDir is the directory on cluster nodes in which pprof (CPU) profiles
+// are dumped. At the end of a test, this directory is copied into the test's
+// ArtifactsDir() from each node in the cluster if --force-cpu-profile is set.
+const cpuProfilesDir = "pprof_dump"
 
 type testStatus struct {
 	msg      string
@@ -683,19 +688,31 @@ func (t *testImpl) IsBuildVersion(minVersion string) bool {
 	return t.BuildVersion().AtLeast(vers)
 }
 
-func panicHandler(_ context.Context, name string, l *logger.Logger, r interface{}) error {
-	return fmt.Errorf("test task %s panicked: %v", name, r)
+// defaultTaskOptions returns the default options for a task started by the test.
+func defaultTaskOptions() []task.Option {
+	return []task.Option{
+		task.PanicHandler(func(_ context.Context, name string, l *logger.Logger, r interface{}) error {
+			return fmt.Errorf("test task %s panicked: %v", name, r)
+		}),
+	}
 }
 
 // GoWithCancel runs the given function in a goroutine and returns a
 // CancelFunc that can be used to cancel the function.
 func (t *testImpl) GoWithCancel(fn task.Func, opts ...task.Option) context.CancelFunc {
-	return t.taskManager.GoWithCancel(fn, task.PanicHandler(panicHandler), task.OptionList(opts...))
+	return t.taskManager.GoWithCancel(
+		fn, task.OptionList(defaultTaskOptions()...), task.OptionList(opts...),
+	)
 }
 
 // Go is like GoWithCancel but without a cancel function.
 func (t *testImpl) Go(fn task.Func, opts ...task.Option) {
 	_ = t.GoWithCancel(fn, task.OptionList(opts...))
+}
+
+// NewGroup starts a new task group.
+func (t *testImpl) NewGroup() task.Group {
+	return t.taskManager.NewGroup(defaultTaskOptions()...)
 }
 
 // TeamCityEscape escapes a string for use as <value> in a key='<value>' attribute

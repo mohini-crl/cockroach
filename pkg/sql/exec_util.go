@@ -125,6 +125,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/tracing/collector"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
+	"github.com/cockroachdb/crlib/crtime"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/redact"
 	io_prometheus_client "github.com/prometheus/client_model/go"
@@ -755,6 +756,13 @@ var (
 		Measurement: "Latency",
 		Unit:        metric.Unit_NANOSECONDS,
 	}
+	MetaSQLExecLatencyDetail = metric.Metadata{
+		Name:        "sql.exec.latency.detail",
+		Help:        "Latency of SQL statement execution, by statement fingerprint",
+		Measurement: "Latency",
+		MetricType:  io_prometheus_client.MetricType_HISTOGRAM,
+		Unit:        metric.Unit_NANOSECONDS,
+	}
 	MetaSQLServiceLatency = metric.Metadata{
 		Name:        "sql.service.latency",
 		Help:        "Latency of SQL request execution",
@@ -795,13 +803,21 @@ var (
 		Name:        "sql.distsql.exec.latency",
 		Help:        "Latency of DistSQL statement execution",
 		Measurement: "Latency",
+		MetricType:  io_prometheus_client.MetricType_HISTOGRAM,
 		Unit:        metric.Unit_NANOSECONDS,
 	}
 	MetaDistSQLServiceLatency = metric.Metadata{
 		Name:        "sql.distsql.service.latency",
 		Help:        "Latency of DistSQL request execution",
 		Measurement: "Latency",
+		MetricType:  io_prometheus_client.MetricType_HISTOGRAM,
 		Unit:        metric.Unit_NANOSECONDS,
+	}
+	MetaUniqueStatementCount = metric.Metadata{
+		Name:        "sql.query.unique.count",
+		Help:        "Cardinality estimate of the set of statement fingerprints",
+		Measurement: "SQL Statements",
+		Unit:        metric.Unit_COUNT,
 	}
 	MetaTxnAbort = metric.Metadata{
 		Name:        "sql.txn.abort.count",
@@ -1931,7 +1947,7 @@ func shouldDistributeGivenRecAndMode(
 func getPlanDistribution(
 	ctx context.Context,
 	txnHasUncommittedTypes bool,
-	distSQLMode sessiondatapb.DistSQLExecMode,
+	sd *sessiondata.SessionData,
 	plan planMaybePhysical,
 	distSQLVisitor *distSQLExprCheckVisitor,
 ) (_ physicalplan.PlanDistribution, distSQLProhibitedErr error) {
@@ -1948,7 +1964,7 @@ func getPlanDistribution(
 		return physicalplan.LocalPlan, nil
 	}
 
-	if distSQLMode == sessiondatapb.DistSQLOff {
+	if sd.DistSQLMode == sessiondatapb.DistSQLOff {
 		return physicalplan.LocalPlan, nil
 	}
 
@@ -1957,14 +1973,14 @@ func getPlanDistribution(
 		return physicalplan.LocalPlan, nil
 	}
 
-	rec, err := checkSupportForPlanNode(plan.planNode, distSQLVisitor)
+	rec, err := checkSupportForPlanNode(plan.planNode, distSQLVisitor, sd)
 	if err != nil {
 		// Don't use distSQL for this request.
 		log.VEventf(ctx, 1, "query not supported for distSQL: %s", err)
 		return physicalplan.LocalPlan, err
 	}
 
-	if shouldDistributeGivenRecAndMode(rec, distSQLMode) {
+	if shouldDistributeGivenRecAndMode(rec, sd.DistSQLMode) {
 		return physicalplan.FullyDistributedPlan, nil
 	}
 	return physicalplan.LocalPlan, nil
@@ -2209,7 +2225,7 @@ type queryMeta struct {
 	txnID uuid.UUID
 
 	// The timestamp when this query began execution.
-	start time.Time
+	start crtime.Mono
 
 	// The SQL statement being executed.
 	stmt statements.Statement[tree.Statement]
@@ -3309,6 +3325,22 @@ func (m *sessionDataMutator) SetExperimentalDistSQLPlanning(
 
 func (m *sessionDataMutator) SetPartiallyDistributedPlansDisabled(val bool) {
 	m.data.PartiallyDistributedPlansDisabled = val
+}
+
+func (m *sessionDataMutator) SetDistributeGroupByRowCountThreshold(val uint64) {
+	m.data.DistributeGroupByRowCountThreshold = val
+}
+
+func (m *sessionDataMutator) SetDistributeSortRowCountThreshold(val uint64) {
+	m.data.DistributeSortRowCountThreshold = val
+}
+
+func (m *sessionDataMutator) SetDistributeScanRowCountThreshold(val uint64) {
+	m.data.DistributeScanRowCountThreshold = val
+}
+
+func (m *sessionDataMutator) SetAlwaysDistributeFullScans(val bool) {
+	m.data.AlwaysDistributeFullScans = val
 }
 
 func (m *sessionDataMutator) SetDisableVecUnionEagerCancellation(val bool) {

@@ -83,6 +83,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tochar"
+	"github.com/cockroachdb/crlib/crtime"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
 	"github.com/cockroachdb/redact"
@@ -133,6 +134,19 @@ var maxNumNonRootConnectionsReason = settings.RegisterStringSetting(
 		"server.cockroach_cloud.max_client_connections_per_gateway",
 	"cluster connections are limited",
 )
+
+// detailedLatencyMetrics enables separate per-statement-fingerprint latency histograms. The utility of this extra
+// detail is expected to exceed its costs in most workloads.
+var detailedLatencyMetrics = settings.RegisterBoolSetting(
+	settings.ApplicationLevel,
+	"sql.stats.detailed_latency_metrics.enabled",
+	"label latency metrics with the statement fingerprint. Workloads with tens of thousands of "+
+		"distinct query fingerprints should leave this setting false.",
+	false,
+)
+
+// The metric label name we'll use to facet latency metrics by statement fingerprint.
+var detailedLatencyMetricLabel = "fingerprint"
 
 // A connExecutor is in charge of executing queries received on a given client
 // connection. The connExecutor implements a state machine (dictated by the
@@ -411,7 +425,7 @@ type ServerMetrics struct {
 // NewServer creates a new Server. Start() needs to be called before the Server
 // is used.
 func NewServer(cfg *ExecutorConfig, pool *mon.BytesMonitor) *Server {
-	metrics := makeMetrics(false /* internal */)
+	metrics := makeMetrics(false /* internal */, &cfg.Settings.SV)
 	serverMetrics := makeServerMetrics(cfg)
 	insightsProvider := insights.New(cfg.Settings, serverMetrics.InsightsMetrics, cfg.InsightsTestingKnobs)
 	// TODO(117690): Unify StmtStatsEnable and TxnStatsEnable into a single cluster setting.
@@ -446,7 +460,7 @@ func NewServer(cfg *ExecutorConfig, pool *mon.BytesMonitor) *Server {
 	s := &Server{
 		cfg:                     cfg,
 		Metrics:                 metrics,
-		InternalMetrics:         makeMetrics(true /* internal */),
+		InternalMetrics:         makeMetrics(true /* internal */, &cfg.Settings.SV),
 		ServerMetrics:           serverMetrics,
 		pool:                    pool,
 		reportedStats:           reportedSQLStats,
@@ -502,7 +516,24 @@ func NewServer(cfg *ExecutorConfig, pool *mon.BytesMonitor) *Server {
 	return s
 }
 
-func makeMetrics(internal bool) Metrics {
+func makeMetrics(internal bool, sv *settings.Values) Metrics {
+	// For internal metrics, don't facet the latency metrics on the fingerprint
+	facetLabels := make([]string, 0, 1)
+	if !internal {
+		facetLabels = append(facetLabels, detailedLatencyMetricLabel)
+	}
+
+	sqlExecLatencyDetail := metric.NewExportedHistogramVec(
+		getMetricMeta(MetaSQLExecLatencyDetail, internal),
+		metric.IOLatencyBuckets,
+		facetLabels,
+	)
+
+	// Clear the latency metrics when we toggle the fingerprint detail setting on or off
+	detailedLatencyMetrics.SetOnChange(sv, func(ctx context.Context) {
+		sqlExecLatencyDetail.Clear()
+	})
+
 	return Metrics{
 		EngineMetrics: EngineMetrics{
 			DistSQLSelectCount:            metric.NewCounter(getMetricMeta(MetaDistSQLSelect, internal)),
@@ -510,6 +541,8 @@ func makeMetrics(internal bool) Metrics {
 			SQLOptFallbackCount:           metric.NewCounter(getMetricMeta(MetaSQLOptFallback, internal)),
 			SQLOptPlanCacheHits:           metric.NewCounter(getMetricMeta(MetaSQLOptPlanCacheHits, internal)),
 			SQLOptPlanCacheMisses:         metric.NewCounter(getMetricMeta(MetaSQLOptPlanCacheMisses, internal)),
+			StatementFingerprintCount:     metric.NewUniqueCounter(getMetricMeta(MetaUniqueStatementCount, internal)),
+			SQLExecLatencyDetail:          sqlExecLatencyDetail,
 			// TODO(mrtracy): See HistogramWindowInterval in server/config.go for the 6x factor.
 			DistSQLExecLatency: metric.NewHistogram(metric.HistogramOptions{
 				Mode:         metric.HistogramModePreferHdrLatency,
@@ -1030,19 +1063,19 @@ func (s *Server) newConnExecutor(
 	// Create the various monitors.
 	// The session monitors are started in activate().
 	sessionRootMon := mon.NewMonitor(mon.Options{
-		Name:     "session root",
+		Name:     mon.MakeMonitorName("session root"),
 		CurCount: memMetrics.CurBytesCount,
 		MaxHist:  memMetrics.MaxBytesHist,
 		Settings: s.cfg.Settings,
 	})
 	sessionMon := mon.NewMonitor(mon.Options{
-		Name:     "session",
+		Name:     mon.MakeMonitorName("session"),
 		CurCount: memMetrics.SessionCurBytesCount,
 		MaxHist:  memMetrics.SessionMaxBytesHist,
 		Settings: s.cfg.Settings,
 	})
 	sessionPreparedMon := mon.NewMonitor(mon.Options{
-		Name:      "session prepared statements",
+		Name:      mon.MakeMonitorName("session prepared statements"),
 		CurCount:  memMetrics.SessionPreparedCurBytesCount,
 		MaxHist:   memMetrics.SessionPreparedMaxBytesHist,
 		Increment: 1024,
@@ -1050,7 +1083,7 @@ func (s *Server) newConnExecutor(
 	})
 	// The txn monitor is started in txnState.resetForNewSQLTxn().
 	txnMon := mon.NewMonitor(mon.Options{
-		Name:     "txn",
+		Name:     mon.MakeMonitorName("txn"),
 		CurCount: memMetrics.TxnCurBytesCount,
 		MaxHist:  memMetrics.TxnMaxBytesHist,
 		Settings: s.cfg.Settings,
@@ -1161,8 +1194,6 @@ func (s *Server) newConnExecutor(
 		ex.applicationName.Store(newName)
 		ex.applicationStats = ex.server.sqlStats.GetApplicationStats(newName)
 	}
-
-	ex.phaseTimes.SetSessionPhaseTime(sessionphase.SessionInit, timeutil.Now())
 
 	ex.extraTxnState.underOuterTxn = underOuterTxn
 	ex.extraTxnState.prepStmtsNamespace = prepStmtNamespace{
@@ -1549,7 +1580,7 @@ type connExecutor struct {
 		// txnFinishClosure contains fields that ex.onTxnFinish uses to execute.
 		txnFinishClosure struct {
 			// txnStartTime is the time that the transaction started.
-			txnStartTime time.Time
+			txnStartTime crtime.Mono
 			// implicit is whether the transaction was implicit.
 			implicit bool
 		}
@@ -2358,7 +2389,7 @@ func (ex *connExecutor) execCmd() (retErr error) {
 		// - ex.statsCollector merely contains a copy of the times, that
 		//   was created when the statement started executing (via the
 		//   Reset() method).
-		ex.statsCollector.PhaseTimes().SetSessionPhaseTime(sessionphase.SessionQueryServiced, timeutil.Now())
+		ex.statsCollector.PhaseTimes().SetSessionPhaseTime(sessionphase.SessionQueryServiced, crtime.NowMono())
 		if err != nil {
 			return err
 		}
@@ -2371,8 +2402,8 @@ func (ex *connExecutor) execCmd() (retErr error) {
 		// message, it is not any more part of the statistics collected
 		// for this execution. In that case, we simply report that
 		// parsing took no time.
-		ex.phaseTimes.SetSessionPhaseTime(sessionphase.SessionStartParse, time.Time{})
-		ex.phaseTimes.SetSessionPhaseTime(sessionphase.SessionEndParse, time.Time{})
+		ex.phaseTimes.SetSessionPhaseTime(sessionphase.SessionStartParse, 0)
+		ex.phaseTimes.SetSessionPhaseTime(sessionphase.SessionEndParse, 0)
 		// We use a closure for the body of the execution so as to
 		// guarantee that the full service time is captured below.
 		err := func() error {
@@ -2470,7 +2501,7 @@ func (ex *connExecutor) execCmd() (retErr error) {
 		//   reset() method).
 		// TODO(sql-sessions): fix the phase time for pausable portals.
 		// https://github.com/cockroachdb/cockroach/issues/99410
-		ex.statsCollector.PhaseTimes().SetSessionPhaseTime(sessionphase.SessionQueryServiced, timeutil.Now())
+		ex.statsCollector.PhaseTimes().SetSessionPhaseTime(sessionphase.SessionQueryServiced, crtime.NowMono())
 		if err != nil {
 			return err
 		}
@@ -2543,7 +2574,7 @@ func (ex *connExecutor) execCmd() (retErr error) {
 		// - ex.statsCollector merely contains a copy of the times, that
 		//   was created when the statement started executing (via the
 		//   reset() method).
-		ex.statsCollector.PhaseTimes().SetSessionPhaseTime(sessionphase.SessionQueryServiced, timeutil.Now())
+		ex.statsCollector.PhaseTimes().SetSessionPhaseTime(sessionphase.SessionQueryServiced, crtime.NowMono())
 	case CopyOut:
 		ex.phaseTimes.SetSessionPhaseTime(sessionphase.SessionQueryReceived, tcmd.TimeReceived)
 		ex.phaseTimes.SetSessionPhaseTime(sessionphase.SessionStartParse, tcmd.ParseStart)
@@ -2559,7 +2590,7 @@ func (ex *connExecutor) execCmd() (retErr error) {
 		// - ex.statsCollector merely contains a copy of the times, that
 		//   was created when the statement started executing (via the
 		//   reset() method).
-		ex.statsCollector.PhaseTimes().SetSessionPhaseTime(sessionphase.SessionQueryServiced, timeutil.Now())
+		ex.statsCollector.PhaseTimes().SetSessionPhaseTime(sessionphase.SessionQueryServiced, crtime.NowMono())
 	case DrainRequest:
 		// We received a drain request. We terminate immediately if we're not in a
 		// transaction. If we are in a transaction, we'll finish as soon as a Sync
@@ -3028,7 +3059,7 @@ func (ex *connExecutor) execCopyOut(
 
 	if ex.sessionData().StmtTimeout > 0 {
 		timerDuration :=
-			ex.sessionData().StmtTimeout - timeutil.Since(ex.phaseTimes.GetSessionPhaseTime(sessionphase.SessionQueryReceived))
+			ex.sessionData().StmtTimeout - ex.phaseTimes.GetSessionPhaseTime(sessionphase.SessionQueryReceived).Elapsed()
 		// There's no need to proceed with execution if the timer has already expired.
 		if timerDuration < 0 {
 			queryTimedOut = true
@@ -3045,7 +3076,7 @@ func (ex *connExecutor) execCopyOut(
 	}
 	if ex.sessionData().TransactionTimeout > 0 && !ex.implicitTxn() {
 		timerDuration :=
-			ex.sessionData().TransactionTimeout - timeutil.Since(ex.phaseTimes.GetSessionPhaseTime(sessionphase.SessionTransactionStarted))
+			ex.sessionData().TransactionTimeout - ex.phaseTimes.GetSessionPhaseTime(sessionphase.SessionTransactionStarted).Elapsed()
 
 		// If the timer already expired, but the transaction is not yet aborted,
 		// we should error immediately without executing. If the timer
@@ -3298,7 +3329,7 @@ func (ex *connExecutor) execCopyIn(
 
 	if ex.sessionData().StmtTimeout > 0 {
 		timerDuration :=
-			ex.sessionData().StmtTimeout - timeutil.Since(ex.phaseTimes.GetSessionPhaseTime(sessionphase.SessionQueryReceived))
+			ex.sessionData().StmtTimeout - ex.phaseTimes.GetSessionPhaseTime(sessionphase.SessionQueryReceived).Elapsed()
 		// There's no need to proceed with execution if the timer has already expired.
 		if timerDuration < 0 {
 			queryTimedOut = true
@@ -3315,7 +3346,7 @@ func (ex *connExecutor) execCopyIn(
 	}
 	if ex.sessionData().TransactionTimeout > 0 && !ex.implicitTxn() {
 		timerDuration :=
-			ex.sessionData().TransactionTimeout - timeutil.Since(ex.phaseTimes.GetSessionPhaseTime(sessionphase.SessionTransactionStarted))
+			ex.sessionData().TransactionTimeout - ex.phaseTimes.GetSessionPhaseTime(sessionphase.SessionTransactionStarted).Elapsed()
 
 		// If the timer already expired, but the transaction is not yet aborted,
 		// we should error immediately without executing. If the timer
@@ -4038,11 +4069,11 @@ func (ex *connExecutor) txnStateTransitionsApplyWrapper(
 		if err != nil {
 			return advanceInfo{}, err
 		}
-		ex.statsCollector.PhaseTimes().SetSessionPhaseTime(sessionphase.SessionStartPostCommitJob, timeutil.Now())
+		ex.statsCollector.PhaseTimes().SetSessionPhaseTime(sessionphase.SessionStartPostCommitJob, crtime.NowMono())
 		if err := ex.waitForTxnJobs(); err != nil {
 			handleErr(err)
 		}
-		ex.statsCollector.PhaseTimes().SetSessionPhaseTime(sessionphase.SessionEndPostCommitJob, timeutil.Now())
+		ex.statsCollector.PhaseTimes().SetSessionPhaseTime(sessionphase.SessionEndPostCommitJob, crtime.NowMono())
 		if err := ex.waitOneVersionForNewVersionDescriptorsWithoutJobs(descIDsInJobs); err != nil {
 			return advanceInfo{}, err
 		}
@@ -4087,7 +4118,7 @@ func (ex *connExecutor) waitForTxnJobs() error {
 	jobWaitCtx := ex.ctxHolder.ctx()
 	var queryTimedout atomic.Bool
 	if ex.sessionData().StmtTimeout > 0 {
-		timePassed := timeutil.Since(ex.phaseTimes.GetSessionPhaseTime(sessionphase.SessionQueryReceived))
+		timePassed := ex.phaseTimes.GetSessionPhaseTime(sessionphase.SessionQueryReceived).Elapsed()
 		if timePassed > ex.sessionData().StmtTimeout {
 			queryTimedout.Store(true)
 		} else {
@@ -4248,10 +4279,11 @@ func (ex *connExecutor) serialize() serverpb.Session {
 
 	if txn != nil {
 		id := txn.ID()
+		elapsedTime := crtime.MonoFromTime(timeNow).Sub(ex.state.mu.txnStart)
 		activeTxnInfo = &serverpb.TxnInfo{
 			ID:                    id,
-			Start:                 ex.state.mu.txnStart,
-			ElapsedTime:           timeNow.Sub(ex.state.mu.txnStart),
+			Start:                 timeNow.Add(-elapsedTime),
+			ElapsedTime:           elapsedTime,
 			NumStatementsExecuted: int32(ex.state.mu.stmtCount),
 			NumRetries:            int32(txn.Epoch()),
 			NumAutoRetries:        ex.state.mu.autoRetryCounter,
@@ -4315,12 +4347,12 @@ func (ex *connExecutor) serialize() serverpb.Session {
 		}
 		sql := truncateSQL(query.stmt.SQL)
 		progress := math.Float64frombits(atomic.LoadUint64(&query.progressAtomic))
-		queryStart := query.start.UTC()
+		elapsedTime := crtime.MonoFromTime(timeNow).Sub(query.start)
 		activeQueries = append(activeQueries, serverpb.ActiveQuery{
 			TxnID:          query.txnID,
 			ID:             id.String(),
-			Start:          queryStart,
-			ElapsedTime:    timeNow.Sub(queryStart),
+			Start:          timeNow.Add(-elapsedTime),
+			ElapsedTime:    elapsedTime,
 			Sql:            sql,
 			SqlNoConstants: sqlNoConstants,
 			SqlSummary:     formatStatementSummary(parsed.AST),
@@ -4360,11 +4392,10 @@ func (ex *connExecutor) serialize() serverpb.Session {
 	}
 
 	return serverpb.Session{
-		Username:        sd.SessionUser().Normalized(),
-		ClientAddress:   remoteStr,
-		ApplicationName: ex.applicationName.Load().(string),
-		// TODO(yuzefovich): this seems like not a concurrency safe call.
-		Start:             ex.phaseTimes.GetSessionPhaseTime(sessionphase.SessionInit).UTC(),
+		Username:          sd.SessionUser().Normalized(),
+		ClientAddress:     remoteStr,
+		ApplicationName:   ex.applicationName.Load().(string),
+		Start:             ex.phaseTimes.InitTime(),
 		ActiveQueries:     activeQueries,
 		ActiveTxn:         activeTxnInfo,
 		NumTxnsExecuted:   ex.extraTxnState.txnCounter.Load(),

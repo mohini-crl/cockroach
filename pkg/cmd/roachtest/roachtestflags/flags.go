@@ -265,6 +265,13 @@ var (
 			binary)`,
 	})
 
+	ForceCpuProfile bool
+	_               = registerRunFlag(&ForceCpuProfile, FlagInfo{
+		Name: "force-cpu-profile",
+		Usage: `
+                        Enable unconditional collection of CPU profiles`,
+	})
+
 	Parallelism int = 10
 	_               = registerRunFlag(&Parallelism, FlagInfo{
 		Name:  "parallelism",
@@ -374,6 +381,13 @@ var (
 	_               = registerRunOpsFlag(&RunForever, FlagInfo{
 		Name:  "run-forever",
 		Usage: "Execute operations indefinitely until the command is terminated, (default false).",
+	})
+
+	WorkloadCluster string = ""
+	_                      = registerRunOpsFlag(&WorkloadCluster, FlagInfo{
+		Name: "workload-cluster",
+		Usage: "Specify the name of the workload cluster. The workload cluster is the one running operations and " +
+			"workloads, such as TPC-C, on the cluster",
 	})
 
 	SideEyeApiToken string = ""

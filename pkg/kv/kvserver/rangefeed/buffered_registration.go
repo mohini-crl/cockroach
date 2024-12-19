@@ -7,7 +7,7 @@ package rangefeed
 
 import (
 	"context"
-	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
@@ -47,14 +47,11 @@ type bufferedRegistration struct {
 	blockWhenFull bool // if true, block when buf is full (for tests)
 
 	mu struct {
-		sync.Locker
+		syncutil.Mutex
 		// True if this registration buffer has overflowed, dropping a live event.
 		// This will cause the registration to exit with an error once the buffer
 		// has been emptied.
 		overflowed bool
-		// Boolean indicating if all events have been output to stream. Used only
-		// for testing.
-		caughtUp bool
 		// Management of the output loop goroutine, used to ensure proper teardown.
 		outputLoopCancelFn func()
 		disconnected       bool
@@ -65,6 +62,10 @@ type bufferedRegistration struct {
 		// that disconnect is called, it is closed by disconnect.
 		catchUpIter *CatchUpIterator
 	}
+
+	// Number of events that have been written to the buffer but
+	// not sent. Used only for testing.
+	testPendingEventToSend atomic.Int64
 }
 
 var _ registration = &bufferedRegistration{}
@@ -98,8 +99,6 @@ func newBufferedRegistration(
 		buf:           make(chan *sharedEvent, bufferSz),
 		blockWhenFull: blockWhenFull,
 	}
-	br.mu.Locker = &syncutil.Mutex{}
-	br.mu.caughtUp = true
 	br.mu.catchUpIter = catchUpIter
 	return br
 }
@@ -109,6 +108,8 @@ func newBufferedRegistration(
 // indicating that live events were lost and a catch-up scan should be initiated.
 // If overflowed is already set, events are ignored and not written to the
 // buffer.
+//
+// nolint:deferunlockcheck
 func (br *bufferedRegistration) publish(
 	ctx context.Context, event *kvpb.RangeFeedEvent, alloc *SharedBudgetAllocation,
 ) {
@@ -124,7 +125,7 @@ func (br *bufferedRegistration) publish(
 	alloc.Use(ctx)
 	select {
 	case br.buf <- e:
-		br.mu.caughtUp = false
+		br.testPendingEventToSend.Add(1)
 	default:
 		// If we're asked to block (in tests), do a blocking send after releasing
 		// the mutex -- otherwise, the output loop won't be able to consume from the
@@ -135,7 +136,7 @@ func (br *bufferedRegistration) publish(
 			select {
 			case br.buf <- e:
 				br.mu.Lock()
-				br.mu.caughtUp = false
+				br.testPendingEventToSend.Add(1)
 			case <-ctx.Done():
 				br.mu.Lock()
 				alloc.Release(ctx)
@@ -188,6 +189,8 @@ func (br *bufferedRegistration) Disconnect(pErr *kvpb.Error) {
 // The loop exits with any error encountered, if the provided context is
 // canceled, or when the buffer has overflowed and all pre-overflow entries
 // have been emitted.
+//
+// nolint:deferunlockcheck
 func (br *bufferedRegistration) outputLoop(ctx context.Context) error {
 	// If the registration has a catch-up scan, run it.
 	if err := br.maybeRunCatchUpScan(ctx); err != nil {
@@ -216,7 +219,6 @@ func (br *bufferedRegistration) outputLoop(ctx context.Context) error {
 		br.mu.Lock()
 		if len(br.buf) == 0 {
 			overflowed = br.mu.overflowed
-			br.mu.caughtUp = true
 		}
 		if firstIteration {
 			wasOverflowedOnFirstIteration = br.mu.overflowed
@@ -235,13 +237,13 @@ func (br *bufferedRegistration) outputLoop(ctx context.Context) error {
 
 		select {
 		case nextEvent := <-br.buf:
-
 			if wasOverflowedOnFirstIteration && !oneCheckpointWithTimestampSent {
 				isCheckpointEvent := nextEvent.event != nil && nextEvent.event.Checkpoint != nil
 				oneCheckpointWithTimestampSent = isCheckpointEvent && !nextEvent.event.Checkpoint.ResolvedTS.IsEmpty()
 			}
 
 			err := br.stream.SendUnbuffered(nextEvent.event)
+			br.testPendingEventToSend.Add(-1)
 			nextEvent.alloc.Release(ctx)
 			putPooledSharedEvent(nextEvent)
 			if err != nil {
@@ -255,6 +257,7 @@ func (br *bufferedRegistration) outputLoop(ctx context.Context) error {
 	}
 }
 
+// nolint:deferunlockcheck
 func (br *bufferedRegistration) runOutputLoop(ctx context.Context, _forStacks roachpb.RangeID) {
 	defer br.drainAllocations(ctx)
 
@@ -308,7 +311,9 @@ func (br *bufferedRegistration) maybeRunCatchUpScan(ctx context.Context) error {
 	return catchUpIter.CatchUpScan(ctx, br.stream.SendUnbuffered, br.withDiff, br.withFiltering, br.withOmitRemote)
 }
 
-// Wait for this registration to completely process its internal buffer.
+// Wait for this registration to completely process its internal
+// buffer. This is only used when a test sends a sync event to the
+// rangefeed processor with testRegCatchupSpan set.
 func (br *bufferedRegistration) waitForCaughtUp(ctx context.Context) error {
 	opts := retry.Options{
 		InitialBackoff: 5 * time.Millisecond,
@@ -317,9 +322,7 @@ func (br *bufferedRegistration) waitForCaughtUp(ctx context.Context) error {
 		MaxRetries:     50,
 	}
 	for re := retry.StartWithCtx(ctx, opts); re.Next(); {
-		br.mu.Lock()
-		caughtUp := len(br.buf) == 0 && br.mu.caughtUp
-		br.mu.Unlock()
+		caughtUp := len(br.buf) == 0 && br.testPendingEventToSend.Load() == 0
 		if caughtUp {
 			return nil
 		}
@@ -346,4 +349,16 @@ var overflowLogEvery = log.Every(5 * time.Second)
 // expect this on some very busy servers.
 func (br *bufferedRegistration) shouldLogOverflow(checkpointSent bool) bool {
 	return (!checkpointSent) || log.V(1) || overflowLogEvery.ShouldLog()
+}
+
+// Used for testing only.
+func (br *bufferedRegistration) getBuf() chan *sharedEvent {
+	return br.buf
+}
+
+// Used for testing only.
+func (br *bufferedRegistration) getOverflowed() bool {
+	br.mu.Lock()
+	defer br.mu.Unlock()
+	return br.mu.overflowed
 }

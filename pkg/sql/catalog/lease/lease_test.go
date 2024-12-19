@@ -12,7 +12,6 @@ import (
 	"context"
 	gosql "database/sql"
 	"fmt"
-	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -56,6 +55,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlinstance/instancestorage"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness/slbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness/slprovider"
+	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -64,6 +64,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/allstacks"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
+	"github.com/cockroachdb/cockroach/pkg/util/debugutil"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -936,7 +937,7 @@ func TestDescriptorRefreshOnRetry(t *testing.T) {
 				RemoveOnceDereferenced: true,
 				LeaseAcquiredEvent: func(desc catalog.Descriptor, _ error) {
 					if desc.GetName() == "foo" {
-						log.Infof(ctx, "lease acquirer stack trace: %s", debug.Stack())
+						log.Infof(ctx, "lease acquirer stack trace: %s", debugutil.Stack())
 						atomic.AddInt32(&fooAcquiredCount, 1)
 					}
 				},
@@ -949,14 +950,16 @@ func TestDescriptorRefreshOnRetry(t *testing.T) {
 			},
 		},
 	}
+	params.Settings = cluster.MakeTestingClusterSettings()
+	// Disable the automatic stats collection, which could interfere with
+	// the lease acquisition counts in this test.
+	stats.AutomaticStatisticsClusterMode.Override(ctx, &params.Settings.SV, false)
+	// Set a long lease duration so that the periodic task to refresh leases does
+	// not run.
+	lease.LeaseDuration.Override(ctx, &params.Settings.SV, 24*time.Hour)
 	srv, sqlDB, kvDB := serverutils.StartServer(t, params)
 	defer srv.Stopper().Stop(context.Background())
 	s := srv.ApplicationLayer()
-	// Disable the automatic stats collection, which could interfere with
-	// the lease acquisition counts in this test.
-	if _, err := sqlDB.Exec("SET CLUSTER SETTING sql.stats.automatic_collection.enabled = false"); err != nil {
-		t.Fatal(err)
-	}
 	if _, err := sqlDB.Exec(`
 CREATE DATABASE t;
 CREATE TABLE t.foo (v INT);
@@ -1323,7 +1326,7 @@ func TestLeaseRenewedAutomatically(testingT *testing.T) {
 				// see a block event dump a stack to aid in debugging.
 				log.Infof(ctx,
 					"Lease acquisition of ID %d resulted in a block event. Stack trace to follow:\n%s",
-					id, debug.Stack())
+					id, debugutil.Stack())
 			},
 		},
 	}
@@ -3216,6 +3219,10 @@ SELECT * FROM T1`)
 func TestLeaseTxnDeadlineExtensionWithSession(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+	// We may not see the desired transaction retry error when running under
+	// race since the txn could end up being aborted because of availability
+	// load in this configuration.
+	skip.UnderRace(t)
 
 	ctx := context.Background()
 	filterMu := syncutil.Mutex{}

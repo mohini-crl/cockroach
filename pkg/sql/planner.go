@@ -34,8 +34,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/exprutil"
 	"github.com/cockroachdb/cockroach/pkg/sql/idxusage"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/querycache"
 	"github.com/cockroachdb/cockroach/pkg/sql/regions"
@@ -333,7 +331,7 @@ func WithDescCollection(collection *descs.Collection) InternalPlannerParamsOptio
 // NewInternalPlanner is an exported version of newInternalPlanner. It
 // returns an interface{} so it can be used outside of the sql package.
 func NewInternalPlanner(
-	opName string,
+	opName redact.SafeString,
 	txn *kv.Txn,
 	user username.SQLUsername,
 	memMetrics *MemoryMetrics,
@@ -353,8 +351,7 @@ func NewInternalPlanner(
 // Returns a cleanup function that must be called once the caller is done with
 // the planner.
 func newInternalPlanner(
-	// TODO(yuzefovich): make this redact.RedactableString.
-	opName string,
+	opName redact.SafeString,
 	txn *kv.Txn,
 	user username.SQLUsername,
 	memMetrics *MemoryMetrics,
@@ -376,7 +373,7 @@ func newInternalPlanner(
 	// asking the caller for one is hard to explain. What we need is better and
 	// separate interfaces for planning and running plans, which could take
 	// suitable contexts.
-	ctx := logtags.AddTag(context.Background(), opName, "")
+	ctx := logtags.AddTag(context.Background(), string(opName), "")
 
 	sd = sd.Clone()
 	if sd.SessionData.Database == "" {
@@ -403,7 +400,7 @@ func newInternalPlanner(
 	}
 
 	plannerMon := mon.NewMonitor(mon.Options{
-		Name:     redact.Sprintf("internal-planner.%s.%s", user, opName),
+		Name:     mon.MakeMonitorName("internal-planner." + opName),
 		CurCount: memMetrics.CurBytesCount,
 		MaxHist:  memMetrics.MaxBytesHist,
 		Settings: execCfg.Settings,
@@ -1010,10 +1007,6 @@ func (p *planner) mustUseLeafTxn() bool {
 func (p *planner) StartHistoryRetentionJob(
 	ctx context.Context, desc string, protectTS hlc.Timestamp, expiration time.Duration,
 ) (jobspb.JobID, error) {
-	if !p.ExecCfg().Settings.Version.IsActive(ctx, clusterversion.V24_1) {
-		return 0, pgerror.New(pgcode.FeatureNotSupported,
-			"history retention job not supported before V24.1")
-	}
 	return StartHistoryRetentionJob(ctx, p.EvalContext(), p.InternalSQLTxn(), desc, protectTS, expiration)
 }
 

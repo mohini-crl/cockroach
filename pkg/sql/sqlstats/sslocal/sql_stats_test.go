@@ -439,7 +439,7 @@ func TestExplicitTxnFingerprintAccounting(t *testing.T) {
 
 	st := cluster.MakeTestingClusterSettings()
 	monitor := mon.NewUnlimitedMonitor(ctx, mon.Options{
-		Name:     "test",
+		Name:     mon.MakeMonitorName("test"),
 		Settings: st,
 	})
 
@@ -557,7 +557,7 @@ func TestAssociatingStmtStatsWithTxnFingerprint(t *testing.T) {
 	st := cluster.MakeTestingClusterSettings()
 	updater := st.MakeUpdater()
 	monitor := mon.NewUnlimitedMonitor(ctx, mon.Options{
-		Name:     "test",
+		Name:     mon.MakeMonitorName("test"),
 		Settings: st,
 	})
 
@@ -785,7 +785,7 @@ func TestTransactionServiceLatencyOnExtendedProtocol(t *testing.T) {
 		// Ensure test case phase times are populated by query txn.
 		require.NotNil(t, tc.phaseTimes)
 		// Ensure SessionTransactionStarted variable is populated.
-		require.False(t, tc.phaseTimes.GetSessionPhaseTime(sessionphase.SessionTransactionStarted).IsZero())
+		require.NotZero(t, tc.phaseTimes.GetSessionPhaseTime(sessionphase.SessionTransactionStarted))
 		// Ensure compute transaction service latency is within a reasonable threshold.
 		require.Less(t, tc.phaseTimes.GetTransactionServiceLatency(), latencyThreshold)
 	}()
@@ -1717,7 +1717,7 @@ func TestSQLStats_ConsumeStats(t *testing.T) {
 
 	st := cluster.MakeTestingClusterSettings()
 	monitor := mon.NewUnlimitedMonitor(context.Background(), mon.Options{
-		Name:     "test",
+		Name:     mon.MakeMonitorName("test"),
 		Settings: st,
 	})
 	insightsProvider := insights.New(st, insights.NewMetrics(), nil)

@@ -10,7 +10,6 @@ import (
 	"strconv"
 
 	"github.com/cockroachdb/cockroach/pkg/backup/backuppb"
-	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/scheduledjobs/schedulebase"
@@ -144,7 +143,6 @@ func doAlterBackupSchedules(
 		p,
 		spec.fullBackupAlways,
 		spec.fullBackupRecurrence,
-		spec.isEnterpriseUser,
 		s,
 	); err != nil {
 		return err
@@ -401,13 +399,18 @@ func processRecurrence(
 	if recurrence == "" {
 		return nil
 	}
+	// Maintain the pause state of the schedule while updating the schedule.
 	if incJob != nil {
-		if err := incJob.SetSchedule(recurrence); err != nil {
-			return err
+		if incJob.IsPaused() {
+			incJob.SetScheduleExpr(recurrence)
+		} else {
+			return incJob.SetScheduleAndNextRun(recurrence)
 		}
 	} else {
-		if err := fullJob.SetSchedule(recurrence); err != nil {
-			return err
+		if fullJob.IsPaused() {
+			fullJob.SetScheduleExpr(recurrence)
+		} else {
+			return fullJob.SetScheduleAndNextRun(recurrence)
 		}
 	}
 	return nil
@@ -418,7 +421,6 @@ func processFullBackupRecurrence(
 	p sql.PlanHookState,
 	fullBackupAlways bool,
 	fullBackupRecurrence string,
-	isEnterpriseUser bool,
 	s scheduleDetails,
 ) (scheduleDetails, error) {
 	var err error
@@ -436,9 +438,7 @@ func processFullBackupRecurrence(
 		}
 		// Copy the cadence from the incremental to the full, and delete the
 		// incremental.
-		if err := s.fullJob.SetSchedule(s.incJob.ScheduleExpr()); err != nil {
-			return scheduleDetails{}, err
-		}
+		s.fullJob.SetScheduleExpr(s.incJob.ScheduleExpr())
 		s.fullArgs.DependentScheduleID = 0
 		s.fullArgs.UnpauseOnSuccess = 0
 		if err := scheduledJobs.Delete(ctx, s.incJob); err != nil {
@@ -447,12 +447,6 @@ func processFullBackupRecurrence(
 		s.incJob = nil
 		s.incArgs = nil
 		return s, nil
-	}
-
-	// We have FULL BACKUP <cron>.
-	if !isEnterpriseUser {
-		return scheduleDetails{}, errors.Newf("Enterprise license required to use incremental backups. " +
-			"To modify the cadence of a full backup, use the 'RECURRING <cron>' clause instead.")
 	}
 
 	if s.incJob == nil {
@@ -513,8 +507,12 @@ func processFullBackupRecurrence(
 	}
 	// We have an incremental backup at this point.
 	// Make no (further) changes, and just edit the cadence on the full.
-	if err := s.fullJob.SetSchedule(fullBackupRecurrence); err != nil {
-		return scheduleDetails{}, err
+	if s.fullJob.IsPaused() {
+		s.fullJob.SetScheduleExpr(fullBackupRecurrence)
+	} else {
+		if err := s.fullJob.SetScheduleAndNextRun(fullBackupRecurrence); err != nil {
+			return scheduleDetails{}, err
+		}
 	}
 
 	fullAny, err := pbtypes.MarshalAny(s.fullArgs)
@@ -582,14 +580,18 @@ func processInto(p sql.PlanHookState, spec *alterBackupScheduleSpec, s scheduleD
 
 	// With a new destination, no full backup has completed yet.
 	// Pause incrementals until a full backup completes.
+	incPaused := s.incJob.IsPaused()
 	s.incJob.Pause()
 	s.incJob.SetScheduleStatus("Waiting for initial backup to complete")
 	s.fullArgs.UnpauseOnSuccess = s.incJob.ScheduleID()
 
-	// Kick off a full backup immediately so we can unpause incrementals.
-	// This mirrors the behavior of CREATE SCHEDULE FOR BACKUP.
-	env := sql.JobSchedulerEnv(p.ExecCfg().JobsKnobs())
-	s.fullJob.SetNextRun(env.Now())
+	// If the inc schedule was not already paused, kick off a full backup immediately
+	// so we can unpause incrementals. This mirrors the behavior of
+	// CREATE SCHEDULE FOR BACKUP.
+	if !incPaused {
+		env := sql.JobSchedulerEnv(p.ExecCfg().JobsKnobs())
+		s.fullJob.SetNextRun(env.Now())
+	}
 
 	return nil
 }
@@ -628,7 +630,6 @@ type alterBackupScheduleSpec struct {
 	recurrence           string
 	fullBackupRecurrence string
 	fullBackupAlways     bool
-	isEnterpriseUser     bool
 	label                string
 	into                 []string
 	backupOptions        tree.BackupOptions
@@ -711,11 +712,6 @@ func makeAlterBackupScheduleSpec(
 	if err != nil {
 		return nil, err
 	}
-
-	enterpriseCheckErr := utilccl.CheckEnterpriseEnabled(
-		p.ExecCfg().Settings,
-		"BACKUP INTO LATEST")
-	spec.isEnterpriseUser = enterpriseCheckErr == nil
 
 	return spec, nil
 }

@@ -38,7 +38,7 @@ func (n *explainVecNode) startExec(params runParams) error {
 	distSQLPlanner := params.extendedEvalCtx.DistSQLPlanner
 	distribution, _ := getPlanDistribution(
 		params.ctx, params.p.Descriptors().HasUncommittedTypes(),
-		params.extendedEvalCtx.SessionData().DistSQLMode, n.plan.main, &params.p.distSQLVisitor,
+		params.extendedEvalCtx.SessionData(), n.plan.main, &params.p.distSQLVisitor,
 	)
 	outerSubqueries := params.p.curPlan.subqueryPlans
 	planCtx := newPlanningCtxForExplainPurposes(distSQLPlanner, params, n.plan.subqueryPlans, distribution)
@@ -86,7 +86,7 @@ func (n *explainVecNode) startExec(params runParams) error {
 
 func newFlowCtxForExplainPurposes(ctx context.Context, p *planner) *execinfra.FlowCtx {
 	monitor := mon.NewMonitor(mon.Options{
-		Name:     "explain",
+		Name:     mon.MakeMonitorName("explain"),
 		Settings: p.execCfg.Settings,
 	})
 	// Note that we do not use planner's monitor here in order to not link any

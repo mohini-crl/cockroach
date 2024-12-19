@@ -204,11 +204,6 @@ func (b *Builder) buildDataSource(
 		// This is the special '[ ... ]' syntax. We treat this as syntactic sugar
 		// for a top-level CTE, so it cannot refer to anything in the input scope.
 		// See #41078.
-		if b.insideFuncDef {
-			panic(unimplemented.NewWithIssue(
-				92961, "statement source (square bracket syntax) within user-defined function",
-			))
-		}
 		emptyScope := b.allocScope()
 		innerScope := b.buildStmt(source.Statement, nil /* desiredTypes */, emptyScope)
 		if len(innerScope.cols) == 0 {
@@ -951,10 +946,7 @@ func (b *Builder) addComputedColsForTable(
 							scalarType, colType, string(tabCol.ColName()),
 						))
 					}
-					// TODO(mgartner): This should be an assignment cast, but
-					// until #81698 is addressed, that could cause reads to
-					// error after adding a virtual computed column to a table.
-					scalar = b.factory.ConstructCast(scalar, colType)
+					scalar = b.factory.ConstructAssignmentCast(scalar, colType)
 				}
 			})
 			// Check if the expression contains non-immutable operators.

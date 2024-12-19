@@ -44,7 +44,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/startup"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
-	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/crlib/crtime"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
 	"github.com/cockroachdb/redact"
@@ -55,11 +55,11 @@ import (
 // steps of background jobs and schema changes. Each session variable is
 // initialized using the correct default value.
 func NewInternalSessionData(
-	ctx context.Context, settings *cluster.Settings, opName string,
+	ctx context.Context, settings *cluster.Settings, opName redact.SafeString,
 ) *sessiondata.SessionData {
 	appName := catconstants.InternalAppNamePrefix
 	if opName != "" {
-		appName = catconstants.InternalAppNamePrefix + "-" + opName
+		appName = catconstants.InternalAppNamePrefix + "-" + string(opName)
 	}
 
 	sd := &sessiondata.SessionData{}
@@ -180,7 +180,7 @@ func MakeInternalExecutorMemMonitor(
 	memMetrics MemoryMetrics, settings *cluster.Settings,
 ) *mon.BytesMonitor {
 	return mon.NewMonitor(mon.Options{
-		Name:       "internal SQL executor",
+		Name:       mon.MakeMonitorName("internal SQL executor"),
 		CurCount:   memMetrics.CurBytesCount,
 		MaxHist:    memMetrics.MaxBytesHist,
 		Settings:   settings,
@@ -1247,7 +1247,7 @@ func (ie *InternalExecutor) execInternal(
 		}
 	}()
 
-	timeReceived := timeutil.Now()
+	timeReceived := crtime.NowMono()
 	parseStart := timeReceived
 	parsed := ieStmt.parsed
 	if parsed.AST == nil {
@@ -1260,7 +1260,7 @@ func (ie *InternalExecutor) execInternal(
 	if err := ie.checkIfStmtIsAllowed(parsed.AST, txn); err != nil {
 		return nil, err
 	}
-	parseEnd := timeutil.Now()
+	parseEnd := crtime.NowMono()
 
 	// Transforms the args to datums. The datum types will be passed as type
 	// hints to the PrepareStmt command below.

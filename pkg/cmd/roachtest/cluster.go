@@ -672,6 +672,10 @@ type clusterImpl struct {
 	grafanaTags               []string
 	disableGrafanaAnnotations atomic.Bool
 
+	// sideEyeClient, if set, is the client used to communicate with the Side-Eye
+	// debugging service.
+	sideEyeClient *sideeyeclient.SideEyeClient
+
 	// State that can be accessed concurrently (in particular, read from the UI
 	// HTML generator).
 	mu struct {
@@ -798,10 +802,18 @@ type clusterFactory struct {
 	// sem is a semaphore throttling the creation of clusters (because AWS has
 	// ridiculous API calls limits).
 	sem chan struct{}
+	// sideEyeClient, if set, is the client used to communicate with the Side-Eye
+	// debugging service.
+	sideEyeClient *sideeyeclient.SideEyeClient
 }
 
 func newClusterFactory(
-	user string, clustersID string, artifactsDir string, r *clusterRegistry, concurrentCreations int,
+	user string,
+	clustersID string,
+	artifactsDir string,
+	r *clusterRegistry,
+	concurrentCreations int,
+	sideEyeClient *sideeyeclient.SideEyeClient,
 ) *clusterFactory {
 	secs := timeutil.Now().Unix()
 	var prefix string
@@ -811,10 +823,11 @@ func newClusterFactory(
 		prefix = fmt.Sprintf("%s-%d-", user, secs)
 	}
 	return &clusterFactory{
-		sem:          make(chan struct{}, concurrentCreations),
-		namePrefix:   prefix,
-		artifactsDir: artifactsDir,
-		r:            r,
+		sem:           make(chan struct{}, concurrentCreations),
+		namePrefix:    prefix,
+		artifactsDir:  artifactsDir,
+		r:             r,
+		sideEyeClient: sideEyeClient,
 	}
 }
 
@@ -988,7 +1001,8 @@ func (f *clusterFactory) newCluster(
 			destroyState: destroyState{
 				owned: true,
 			},
-			l: l,
+			sideEyeClient: f.sideEyeClient,
+			l:             l,
 		}
 		c.status("creating cluster")
 
@@ -2161,6 +2175,17 @@ func (c *clusterImpl) StartE(
 		settings.Env = append(settings.Env, "COCKROACH_INTERNAL_CHECK_CONSISTENCY_FATAL=true")
 	}
 
+	if roachtestflags.ForceCpuProfile {
+		settings.ClusterSettings["server.cpu_profile.duration"] = "20s"
+		settings.ClusterSettings["server.cpu_profile.interval"] = "1m"
+		// NB: the docs say that the profiling becomes unconditional if
+		// you set the threshold to 0. This is incorrect, the database
+		// has no such functionality. We set it to 1 as we expect the
+		// CPU usage % to be greater than 1% either way.
+		settings.ClusterSettings["server.cpu_profile.cpu_usage_combined_threshold"] = "1"
+		settings.ClusterSettings["server.cpu_profile.total_dump_size_limit"] = "256 MiB"
+	}
+
 	clusterSettingsOpts := c.configureClusterSettingOptions(c.clusterSettings, settings)
 
 	if err := roachprod.Start(ctx, l, c.MakeNodes(opts...), startOpts.RoachprodOpts, clusterSettingsOpts...); err != nil {
@@ -3171,13 +3196,17 @@ func (c *clusterImpl) UpdateSideEyeEnvironmentName(
 // swallowed.
 //
 // Returns the URL of the captured snapshot, or "" if not successful.
-func (c *clusterImpl) CaptureSideEyeSnapshot(
-	ctx context.Context, l *logger.Logger, client *sideeyeclient.SideEyeClient,
-) string {
+func (c *clusterImpl) CaptureSideEyeSnapshot(ctx context.Context) string {
+	l := c.t.L()
 	l.PrintfCtx(ctx, "capturing snapshot of the cluster with Side-Eye...")
 
 	if c.arch == vm.ArchARM64 {
 		l.Printf("Side-Eye does not support ARM64 machines; skipping snapshot")
+		return ""
+	}
+
+	if c.sideEyeClient == nil {
+		l.Printf("WARNING: Side-Eye client is not configured")
 		return ""
 	}
 
@@ -3187,7 +3216,7 @@ func (c *clusterImpl) CaptureSideEyeSnapshot(
 		return ""
 	}
 
-	snapURL, ok := roachprod.CaptureSideEyeSnapshot(ctx, l, envName, client)
+	snapURL, ok := roachprod.CaptureSideEyeSnapshot(ctx, l, envName, c.sideEyeClient)
 	if !ok {
 		return ""
 	}

@@ -141,6 +141,7 @@ vectorized: true
       table: unindexed@unindexed_pkey
       spans: [/1 - ]
       limit: 1
+      locking strength: for update
 
 query T
 EXPLAIN DELETE FROM indexed WHERE value = 5 LIMIT 10
@@ -157,6 +158,7 @@ vectorized: true
       table: indexed@indexed_value_idx
       spans: [/5 - /5]
       limit: 10
+      locking strength: for update
 
 query T
 EXPLAIN DELETE FROM indexed LIMIT 10
@@ -173,6 +175,7 @@ vectorized: true
       table: indexed@indexed_value_idx
       spans: LIMITED SCAN
       limit: 10
+      locking strength: for update
 
 # TODO(andyk): Prune columns so that index-join is not necessary.
 query T
@@ -190,6 +193,7 @@ vectorized: true
       table: indexed@indexed_value_idx
       spans: [/5 - /5]
       limit: 10
+      locking strength: for update
 
 # Ensure that index hints in DELETE statements force the choice of a specific index
 # as described in #38799.
@@ -213,6 +217,7 @@ vectorized: true
       estimated row count: 1,000 (missing stats)
       table: t38799@foo
       spans: FULL SCAN
+      locking strength: for update
 
 # Tracing tests for fast delete.
 statement ok
@@ -231,9 +236,9 @@ SELECT operation, message FROM [SHOW KV TRACE FOR SESSION]
 WHERE message LIKE '%DelRange%' OR message LIKE '%DelRng%'
 ----
 delete range      DelRange /Table/110/1 - /Table/110/2
-dist sender send  r73: sending batch 1 DelRng to (n1,s1):1
+dist sender send  r74: sending batch 1 DelRng to (n1,s1):1
 delete range      DelRange /Table/110/1/601/0 - /Table/110/2
-dist sender send  r73: sending batch 1 DelRng to (n1,s1):1
+dist sender send  r74: sending batch 1 DelRng to (n1,s1):1
 
 # Ensure that DelRange requests are autocommitted when DELETE FROM happens on a
 # chunk of fewer than 600 keys.
@@ -252,7 +257,7 @@ SELECT operation, message FROM [SHOW KV TRACE FOR SESSION]
 WHERE message LIKE '%Del%' OR message LIKE '%sending batch%'
 ----
 delete range      Del /Table/110/1/5/0
-dist sender send  r73: sending batch 1 Del, 1 EndTxn to (n1,s1):1
+dist sender send  r74: sending batch 1 Del, 1 EndTxn to (n1,s1):1
 
 # Ensure that we send DelRanges when doing a point delete operation on a table
 # that has multiple column families.
@@ -271,7 +276,7 @@ SELECT operation, message FROM [SHOW KV TRACE FOR SESSION]
 WHERE message LIKE '%Del%' OR message LIKE '%sending batch%'
 ----
 delete range      DelRange /Table/111/1/5 - /Table/111/1/6
-dist sender send  r73: sending batch 1 DelRng to (n1,s1):1
+dist sender send  r74: sending batch 1 DelRng to (n1,s1):1
 
 statement ok
 CREATE TABLE xyz (
@@ -331,12 +336,14 @@ vectorized: true
         │ estimated row count: 990 (missing stats)
         │ table: xyz@xyz_pkey
         │ key columns: x
+        │ locking strength: for update
         │
         └── • scan
               columns: (x, y)
               estimated row count: 990 (missing stats)
               table: xyz@xyz_y_idx
               spans: /1-/1000 /2001-/3000
+              locking strength: for update
 
 # Testcase for issue 105803.
 

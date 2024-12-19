@@ -78,7 +78,8 @@ func runAnalyzer(pass *analysis.Pass) (interface{}, error) {
 						"Status":        {},
 					},
 					"github.com/cockroachdb/cockroach/pkg/jobs/jobspb": {
-						"Type": {},
+						"Type":                      {},
+						"ResolvedSpan_BoundaryType": {},
 					},
 					"github.com/cockroachdb/cockroach/pkg/kv/bulk": {
 						"sz":     {},
@@ -206,6 +207,10 @@ func runAnalyzer(pass *analysis.Pass) (interface{}, error) {
 						"TriggerActionTime": {},
 						"TriggerEventType":  {},
 					},
+					"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scop": {
+						"Phase": {},
+						"Type":  {},
+					},
 					"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scplan/internal/scgraph": {
 						"RuleName": {},
 					},
@@ -259,6 +264,9 @@ func runAnalyzer(pass *analysis.Pass) (interface{}, error) {
 					},
 					"github.com/cockroachdb/redact/internal/redact": {
 						"safeWrapper": {},
+					},
+					"github.com/cockroachdb/cockroach/pkg/util/debugutil": {
+						"SafeStack": {},
 					},
 				}
 				ty := recv[0].Type

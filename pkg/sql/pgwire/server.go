@@ -45,6 +45,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/crlib/crtime"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
 	"github.com/cockroachdb/redact"
@@ -433,7 +434,7 @@ func MakeServer(
 		},
 	}
 	server.sqlMemoryPool = mon.NewMonitor(mon.Options{
-		Name: "sql",
+		Name: mon.MakeMonitorName("sql"),
 		// Note that we don't report metrics on this monitor. The reason for this is
 		// that we report metrics on the sum of all the child monitors of this pool.
 		// This monitor is the "main sql" monitor. It's a child of the root memory
@@ -449,7 +450,7 @@ func MakeServer(
 	server.SQLServer = sql.NewServer(executorConfig, server.sqlMemoryPool)
 
 	server.tenantSpecificConnMonitor = mon.NewMonitor(mon.Options{
-		Name:       "conn",
+		Name:       mon.MakeMonitorName("conn"),
 		CurCount:   server.tenantMetrics.ConnMemMetrics.CurBytesCount,
 		MaxHist:    server.tenantMetrics.ConnMemMetrics.MaxBytesHist,
 		Increment:  int64(connReservationBatchSize) * baseSQLMemoryBudget,
@@ -1282,7 +1283,7 @@ func (s *Server) serveImpl(
 				// packet) and instead return a broken pipe or io.EOF error message.
 				return false, isSimpleQuery, errors.Wrap(err, "pgwire: error reading input")
 			}
-			timeReceived := timeutil.Now()
+			timeReceived := crtime.NowMono()
 			log.VEventf(ctx, 2, "pgwire: processing %s", typ)
 
 			if ignoreUntilSync {
