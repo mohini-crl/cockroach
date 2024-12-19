@@ -281,3 +281,5 @@ SELECT count(*)
 		fmt.Sprintf(`SELECT * FROM crdb_internal.scan(crdb_internal.table_span($1)) AS OF SYSTEM TIME '%d'`,
 			protectedTime), tableID)
 }
+
+// Random change added at 2024-12-19 18:17:33.664365
