@@ -88,6 +88,10 @@ const (
 	alterFunctionRename    // ALTER FUNCTION <function> RENAME TO <name>
 	alterFunctionSetSchema // ALTER FUNCTION <function> SET SCHEMA <schema>
 
+	// ALTER POLICY ...
+
+	alterPolicy // ALTER POLICY <policy> ON <table> [RENAME TO <new_name>] [TO <roles>] [USING (<using_expr>)] [WITH CHECK (<check_expr>)]
+
 	// ALTER TABLE <table> ...
 
 	alterTableAddColumn               // ALTER TABLE <table> ADD [COLUMN] <column> <type>
@@ -233,6 +237,7 @@ var opFuncs = []func(*operationGenerator, context.Context, pgx.Tx) (*opStmt, err
 	alterTableSetColumnDefault:        (*operationGenerator).setColumnDefault,
 	alterTableSetColumnNotNull:        (*operationGenerator).setColumnNotNull,
 	alterTypeDropValue:                (*operationGenerator).alterTypeDropValue,
+	alterPolicy:                       (*operationGenerator).alterPolicy,
 	commentOn:                         (*operationGenerator).commentOn,
 	createFunction:                    (*operationGenerator).createFunction,
 	createIndex:                       (*operationGenerator).createIndex,
@@ -287,6 +292,7 @@ var opWeights = []int{
 	alterTableSetColumnDefault:        1,
 	alterTableSetColumnNotNull:        1,
 	alterTypeDropValue:                1,
+	alterPolicy:                       1,
 	commentOn:                         1,
 	createFunction:                    1,
 	createIndex:                       1,
@@ -329,6 +335,7 @@ var opDeclarativeVersion = map[opType]clusterversion.Key{
 	alterTableDropNotNull:             clusterversion.MinSupported,
 	alterTableRLS:                     clusterversion.V25_2,
 	alterTypeDropValue:                clusterversion.MinSupported,
+	alterPolicy:                       clusterversion.V25_2,
 	commentOn:                         clusterversion.MinSupported,
 	createIndex:                       clusterversion.MinSupported,
 	createFunction:                    clusterversion.MinSupported,
