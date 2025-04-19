@@ -61,9 +61,9 @@ message BackfillerSpec {
   optional uint64 update_chunk_size_threshold_bytes = 14 [(gogoproto.nullable) = false];
 
   // WriteAsOf is the time that the backfill entries should be written.
-  // Note: Older nodes may also use this as the read time instead of readAsOf.
   optional util.hlc.Timestamp writeAsOf = 7 [(gogoproto.nullable) = false];
   // The timestamp to perform index backfill historical scans at.
+  // This is only used by the column backfiller.
   optional util.hlc.Timestamp readAsOf = 9 [(gogoproto.nullable) = false];
 
   // IndexesToBackfill is the set of indexes to backfill. This is populated only
@@ -79,12 +79,13 @@ message BackfillerSpec {
   // timestamp, even if the request gets pushed server-side. This ensures the
   // writes comply with the timestamp cache and closed timestamp. See also
   // AddSSTableRequest.SSTTimestampToRequestTimestamp.
-  //
-  // Note that older nodes do not respect this flag so callers should
-  // check MVCCAddSSTable before setting this option.
   optional bool write_at_batch_timestamp = 12 [(gogoproto.nullable) = false];
 
-  // NEXTID: 15.
+  // SourceIndexID is the source index that will be used for this backfill. If
+  // the value of 0 is specified then the primary index will be used implicitly.
+  optional uint32 source_index_id = 16 [(gogoproto.nullable) = false, (gogoproto.customname) = "SourceIndexID", (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb.IndexID"];
+
+  // NEXTID: 17.
 }
 
 // JobProgress identifies the job to report progress on. This reporting
@@ -534,7 +535,11 @@ message LogicalReplicationWriterSpec {
 
     optional string metrics_label = 11 [(gogoproto.nullable) = false];
 
-    // Next ID: 13.
+    repeated cockroach.sql.sqlbase.TypeDescriptor type_descriptors = 13;
+
+    optional string writer_type = 14 [(gogoproto.nullable) = false];
+
+    // Next ID: 15.
 }
 
 message LogicalReplicationOfflineScanSpec {
@@ -566,4 +571,32 @@ message LogicalReplicationOfflineScanSpec {
 
     optional string metrics_label = 8 [(gogoproto.nullable) = false];
 
+}
+
+message CompactBackupsSpec {
+  optional int64 job_id = 1 [(gogoproto.nullable) = false, (gogoproto.customname) = "JobID"];
+  optional string default_uri = 2 [(gogoproto.nullable) = false, (gogoproto.customname) = "DefaultURI"];
+  optional jobs.jobspb.BackupDetails.Destination destination = 3 [(gogoproto.nullable) = false];
+  optional jobs.jobspb.BackupEncryptionOptions encryption = 4;
+  optional util.hlc.Timestamp startTime = 5 [(gogoproto.nullable) = false];
+  optional util.hlc.Timestamp endTime = 6 [(gogoproto.nullable) = false];
+  optional ElidePrefix elide_mode = 7 [(gogoproto.nullable) = false];
+  // spans represents the entire set of spans to be compacted. We send all of the
+	// spans to all processors because each processor needs to be able to call
+	// generateAndSendImportSpans to then cross check the generated spans against
+	// the assigned spans. We are uncertain if generateAndSendImportSpans will work
+	// if it is only provided the assigned spans, so to be safe we send the entire
+	// set of spans.
+  repeated roachpb.Span spans = 8 [(gogoproto.nullable) = false];
+  // assigned_spans represents the spans assigned to this particular processor 
+  // to compact.
+  repeated roachpb.Span assigned_spans = 9 [(gogoproto.nullable) = false];
+  optional string user_proto = 10 [(gogoproto.nullable) = false, (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/security/username.SQLUsernameProto"];
+	// Since compaction processors each have to run generateAndSendImportSpans,
+	// both target_size and max_files are sent through to the spec to ensure
+	// consistent values are used in the event those cluster settings are changed
+	// before the processors can load them.
+	optional int64 target_size = 11 [(gogoproto.nullable) = false];
+	optional int64 max_files = 12 [(gogoproto.nullable) = false];
+	// NEXT ID: 13.
 }

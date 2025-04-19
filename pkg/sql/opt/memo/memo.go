@@ -7,6 +7,7 @@
 package memo
 
 import (
+	"bytes"
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation"
@@ -142,8 +143,6 @@ type Memo struct {
 
 	// The following are selected fields from SessionData which can affect
 	// planning. We need to cross-check these before reusing a cached memo.
-	// NOTE: If you add new fields here, be sure to add them to the relevant
-	//       fields in explain_bundle.go.
 	reorderJoinsLimit                          int
 	zigzagJoinEnabled                          bool
 	useForecasts                               bool
@@ -200,6 +199,11 @@ type Memo struct {
 	pushLimitIntoProjectFilteredScan           bool
 	unsafeAllowTriggersModifyingCascades       bool
 	legacyVarcharTyping                        bool
+	preferBoundedCardinality                   bool
+	minRowCount                                float64
+	checkInputMinRowCount                      float64
+	planLookupJoinsWithReverseScans            bool
+	useInsertFastPath                          bool
 	internal                                   bool
 
 	// txnIsoLevel is the isolation level under which the plan was created. This
@@ -212,6 +216,10 @@ type Memo struct {
 
 	// curWithID is the highest currently in-use WITH ID.
 	curWithID opt.WithID
+
+	// curRoutineResultBufferID is the highest currently in-use routine result
+	// buffer ID. See the RoutineResultBufferID comment for more details.
+	curRoutineResultBufferID RoutineResultBufferID
 
 	newGroupFn func(opt.Expr)
 
@@ -293,6 +301,11 @@ func (m *Memo) Init(ctx context.Context, evalCtx *eval.Context) {
 		pushLimitIntoProjectFilteredScan:           evalCtx.SessionData().OptimizerPushLimitIntoProjectFilteredScan,
 		unsafeAllowTriggersModifyingCascades:       evalCtx.SessionData().UnsafeAllowTriggersModifyingCascades,
 		legacyVarcharTyping:                        evalCtx.SessionData().LegacyVarcharTyping,
+		preferBoundedCardinality:                   evalCtx.SessionData().OptimizerPreferBoundedCardinality,
+		minRowCount:                                evalCtx.SessionData().OptimizerMinRowCount,
+		checkInputMinRowCount:                      evalCtx.SessionData().OptimizerCheckInputMinRowCount,
+		planLookupJoinsWithReverseScans:            evalCtx.SessionData().OptimizerPlanLookupJoinsWithReverseScans,
+		useInsertFastPath:                          evalCtx.SessionData().InsertFastPath,
 		internal:                                   evalCtx.SessionData().Internal,
 		txnIsoLevel:                                evalCtx.TxnIsoLevel,
 	}
@@ -463,6 +476,11 @@ func (m *Memo) IsStale(
 		m.pushLimitIntoProjectFilteredScan != evalCtx.SessionData().OptimizerPushLimitIntoProjectFilteredScan ||
 		m.unsafeAllowTriggersModifyingCascades != evalCtx.SessionData().UnsafeAllowTriggersModifyingCascades ||
 		m.legacyVarcharTyping != evalCtx.SessionData().LegacyVarcharTyping ||
+		m.preferBoundedCardinality != evalCtx.SessionData().OptimizerPreferBoundedCardinality ||
+		m.minRowCount != evalCtx.SessionData().OptimizerMinRowCount ||
+		m.checkInputMinRowCount != evalCtx.SessionData().OptimizerCheckInputMinRowCount ||
+		m.planLookupJoinsWithReverseScans != evalCtx.SessionData().OptimizerPlanLookupJoinsWithReverseScans ||
+		m.useInsertFastPath != evalCtx.SessionData().InsertFastPath ||
 		m.internal != evalCtx.SessionData().Internal ||
 		m.txnIsoLevel != evalCtx.TxnIsoLevel {
 		return true, nil
@@ -549,14 +567,12 @@ func (m *Memo) NextRank() opt.ScalarRank {
 	return m.curRank
 }
 
-// CopyNextRankFrom copies the next ScalarRank from the other memo.
-func (m *Memo) CopyNextRankFrom(other *Memo) {
+// CopyRankAndIDsFrom copies the next ScalarRank, WithID, and
+// RoutineResultBufferID from the other memo.
+func (m *Memo) CopyRankAndIDsFrom(other *Memo) {
 	m.curRank = other.curRank
-}
-
-// CopyNextWithIDFrom copies the next WithID from the other memo.
-func (m *Memo) CopyNextWithIDFrom(other *Memo) {
 	m.curWithID = other.curWithID
+	m.curRoutineResultBufferID = other.curRoutineResultBufferID
 }
 
 // RequestColStat calculates and returns the column statistic calculated on the
@@ -600,11 +616,20 @@ func (m *Memo) NextWithID() opt.WithID {
 	return m.curWithID
 }
 
+// NextRoutineResultBufferID returns a not-yet-assigned identifier for the
+// result buffer of a PL/pgSQL set-returning function.
+func (m *Memo) NextRoutineResultBufferID() RoutineResultBufferID {
+	m.curRoutineResultBufferID++
+	return m.curRoutineResultBufferID
+}
+
 // Detach is used when we detach a memo that is to be reused later (either for
 // execbuilding or with AssignPlaceholders). New expressions should no longer be
 // constructed in this memo.
 func (m *Memo) Detach() {
 	m.interner = interner{}
+	m.replacer = nil
+
 	// It is important to not hold on to the EvalCtx in the logicalPropsBuilder
 	// (#57059).
 	m.logPropsBuilder = logicalPropsBuilder{}
@@ -634,9 +659,27 @@ func (m *Memo) DisableCheckExpr() {
 	m.disableCheckExpr = true
 }
 
-// EvalContext returns the eval.Context of the current SQL request.
-func (m *Memo) EvalContext() *eval.Context {
-	return m.logPropsBuilder.evalCtx
+// String prints the current expression tree stored in the memo. It should only
+// be used for testing and debugging.
+func (m *Memo) String() string {
+	return m.FormatExpr(m.rootExpr)
+}
+
+// FormatExpr prints the given expression for testing and debugging.
+func (m *Memo) FormatExpr(expr opt.Expr) string {
+	if expr == nil {
+		return ""
+	}
+	f := MakeExprFmtCtxBuffer(
+		context.Background(),
+		&bytes.Buffer{},
+		ExprFmtHideQualifications,
+		false, /* redactableValues */
+		m,
+		nil, /* catalog */
+	)
+	f.FormatExpr(expr)
+	return f.Buffer.String()
 }
 
 // ValuesContainer lets ValuesExpr and LiteralValuesExpr share code.

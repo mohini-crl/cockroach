@@ -29,12 +29,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cli/cliflags"
 	"github.com/cockroachdb/cockroach/pkg/cli/syncbench"
 	"github.com/cockroachdb/cockroach/pkg/cloud"
-	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/gc"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/print"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/rditer"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
@@ -313,13 +312,13 @@ func runDebugKeys(cmd *cobra.Command, args []string) error {
 			}
 			return strings.Join(pairs, ", "), nil
 		}
-		kvserver.DebugSprintMVCCKeyValueDecoders = append(kvserver.DebugSprintMVCCKeyValueDecoders, fn)
+		print.DebugSprintMVCCKeyValueDecoders = append(print.DebugSprintMVCCKeyValueDecoders, fn)
 	}
 	printer := printKey
 	rangeKeyPrinter := printRangeKey
 	if debugCtx.values {
-		printer = kvserver.PrintMVCCKeyValue
-		rangeKeyPrinter = kvserver.PrintMVCCRangeKeyValue
+		printer = print.PrintMVCCKeyValue
+		rangeKeyPrinter = print.PrintMVCCRangeKeyValue
 	}
 
 	keyTypeOptions := keyTypeParams[debugCtx.keyTypes]
@@ -402,7 +401,7 @@ func runDebugBallast(cmd *cobra.Command, args []string) error {
 	if math.Abs(p) > 100 {
 		return errors.Errorf("absolute percentage value %f greater than 100", p)
 	}
-	b := debugCtx.ballastSize.InBytes
+	b := debugCtx.ballastSize.Capacity
 	if p != 0 && b != 0 {
 		return errors.New("expected exactly one of percentage or bytes non-zero, found both")
 	}
@@ -468,8 +467,8 @@ func runDebugRangeData(cmd *cobra.Command, args []string) error {
 
 	earlyBootAccessor := cloud.NewEarlyBootExternalStorageAccessor(serverCfg.Settings, serverCfg.ExternalIODirConfig, cidr.NewLookup(&serverCfg.Settings.SV))
 	opts := []storage.ConfigOption{storage.MustExist, storage.RemoteStorageFactory(earlyBootAccessor)}
-	if serverCfg.SharedStorage != "" {
-		es, err := cloud.ExternalStorageFromURI(ctx, serverCfg.SharedStorage,
+	if serverCfg.StorageConfig.SharedStorage.URI != "" {
+		es, err := cloud.ExternalStorageFromURI(ctx, serverCfg.StorageConfig.SharedStorage.URI,
 			base.ExternalIODirConfig{}, serverCfg.Settings, nil, username.RootUserName(), nil,
 			nil, cloud.NilMetrics)
 		if err != nil {
@@ -510,7 +509,7 @@ func runDebugRangeData(cmd *cobra.Command, args []string) error {
 					if err != nil {
 						return err
 					}
-					kvserver.PrintEngineKeyValue(key, v)
+					print.PrintEngineKeyValue(key, v)
 					results++
 					if results == debugCtx.maxResults {
 						return iterutil.StopIteration()
@@ -523,7 +522,7 @@ func runDebugRangeData(cmd *cobra.Command, args []string) error {
 						return err
 					}
 					for _, v := range iter.EngineRangeKeys() {
-						kvserver.PrintEngineRangeKeyValue(bounds, v)
+						print.PrintEngineRangeKeyValue(bounds, v)
 						results++
 						if results == debugCtx.maxResults {
 							return iterutil.StopIteration()
@@ -554,7 +553,7 @@ func loadRangeDescriptor(
 			// We only want values, not MVCCMetadata.
 			return nil
 		}
-		if err := kvserver.IsRangeDescriptorKey(kv.Key); err != nil {
+		if err := print.IsRangeDescriptorKey(kv.Key); err != nil {
 			// Range descriptor keys are interleaved with others, so if it
 			// doesn't parse as a range descriptor just skip it.
 			return nil //nolint:returnerrcheck
@@ -610,10 +609,10 @@ func runDebugRangeDescriptors(cmd *cobra.Command, args []string) error {
 	return db.MVCCIterate(cmd.Context(), start, end, storage.MVCCKeyAndIntentsIterKind,
 		storage.IterKeyTypePointsOnly, fs.UnknownReadCategory,
 		func(kv storage.MVCCKeyValue, _ storage.MVCCRangeKeyStack) error {
-			if kvserver.IsRangeDescriptorKey(kv.Key) != nil {
+			if print.IsRangeDescriptorKey(kv.Key) != nil {
 				return nil
 			}
-			kvserver.PrintMVCCKeyValue(kv)
+			print.PrintMVCCKeyValue(kv)
 			return nil
 		})
 }
@@ -694,7 +693,7 @@ Decode and print a hexadecimal-encoded key-value pair.
 			//   is already a roachpb.Key, so make a half-assed attempt to support both.
 			if !isTS {
 				if k, ok := storage.DecodeEngineKey(bs[0]); ok {
-					kvserver.PrintEngineKeyValue(k, bs[1])
+					print.PrintEngineKeyValue(k, bs[1])
 					return nil
 				}
 				fmt.Printf("unable to decode key: %v, assuming it's a roachpb.Key with fake timestamp;\n"+
@@ -706,7 +705,7 @@ Decode and print a hexadecimal-encoded key-value pair.
 			}
 		}
 
-		kvserver.PrintMVCCKeyValue(storage.MVCCKeyValue{
+		print.PrintMVCCKeyValue(storage.MVCCKeyValue{
 			Key:   k,
 			Value: bs[1],
 		})
@@ -788,7 +787,7 @@ func runDebugRaftLog(cmd *cobra.Command, args []string) error {
 	return db.MVCCIterate(cmd.Context(), start, end, storage.MVCCKeyIterKind,
 		storage.IterKeyTypePointsOnly, fs.UnknownReadCategory,
 		func(kv storage.MVCCKeyValue, _ storage.MVCCRangeKeyStack) error {
-			kvserver.PrintMVCCKeyValue(kv)
+			print.PrintMVCCKeyValue(kv)
 			return nil
 		})
 }
@@ -879,23 +878,25 @@ func runDebugGCCmd(cmd *cobra.Command, args []string) error {
 	}
 
 	for _, desc := range descs {
-		snap := db.NewSnapshot()
-		defer snap.Close()
-		now := hlc.Timestamp{WallTime: timeutil.Now().UnixNano()}
-		thresh := gc.CalculateThreshold(now, gcTTL)
-		info, err := gc.Run(
-			context.Background(),
-			&desc, snap,
-			now, thresh,
-			gc.RunOptions{
-				LockAgeThreshold:              lockAgeThreshold,
-				MaxLocksPerIntentCleanupBatch: lockBatchSize,
-				TxnCleanupThreshold:           txnCleanupThreshold,
-			},
-			gcTTL, gc.NoopGCer{},
-			func(_ context.Context, _ []roachpb.Lock) error { return nil },
-			func(_ context.Context, _ *roachpb.Transaction) error { return nil },
-		)
+		info, err := func() (gc.Info, error) {
+			snap := db.NewSnapshot()
+			defer snap.Close()
+			now := hlc.Timestamp{WallTime: timeutil.Now().UnixNano()}
+			thresh := gc.CalculateThreshold(now, gcTTL)
+			return gc.Run(
+				context.Background(),
+				&desc, snap,
+				now, thresh,
+				gc.RunOptions{
+					LockAgeThreshold:              lockAgeThreshold,
+					MaxLocksPerIntentCleanupBatch: lockBatchSize,
+					TxnCleanupThreshold:           txnCleanupThreshold,
+				},
+				gcTTL, gc.NoopGCer{},
+				func(_ context.Context, _ []roachpb.Lock) error { return nil },
+				func(_ context.Context, _ *roachpb.Transaction) error { return nil },
+			)
+		}()
 		if err != nil {
 			return err
 		}
@@ -956,11 +957,6 @@ func runDebugCompact(cmd *cobra.Command, args []string) error {
 		storage.MustExist,
 		storage.DisableAutomaticCompactions,
 		storage.MaxConcurrentCompactions(debugCompactOpts.maxConcurrency),
-		// Currently, any concurrency over 0 enables Writer parallelism.
-		storage.MaxWriterConcurrency(1),
-		// Force Writer Parallelism will allow Writer parallelism to
-		// be enabled without checking the CPU.
-		storage.ForceWriterParallelism,
 	)
 	if err != nil {
 		return err
@@ -1068,16 +1064,6 @@ func parseGossipValues(gossipInfo *gossip.InfoStatus) (string, error) {
 				return "", errors.Wrapf(err, "failed to parse value for key %q", key)
 			}
 			output = append(output, fmt.Sprintf("%q: %v", key, clusterID))
-		} else if key == gossip.KeyDeprecatedSystemConfig {
-			if debugCtx.printSystemConfig {
-				var config config.SystemConfigEntries
-				if err := protoutil.Unmarshal(bytes, &config); err != nil {
-					return "", errors.Wrapf(err, "failed to parse value for key %q", key)
-				}
-				output = append(output, fmt.Sprintf("%q: %+v", key, config))
-			} else {
-				output = append(output, fmt.Sprintf("%q: omitted", key))
-			}
 		} else if key == gossip.KeyFirstRangeDescriptor {
 			var desc roachpb.RangeDescriptor
 			if err := protoutil.Unmarshal(bytes, &desc); err != nil {
@@ -1395,7 +1381,7 @@ func (m mvccValueFormatter) Format(f fmt.State, c rune) {
 		errors.FormatError(m.err, f, c)
 		return
 	}
-	fmt.Fprint(f, kvserver.SprintMVCCKeyValue(m.kv, false /* printKey */))
+	fmt.Fprint(f, print.SprintMVCCKeyValue(m.kv, false /* printKey */))
 }
 
 // lockValueFormatter is a fmt.Formatter for lock values.
@@ -1405,7 +1391,7 @@ type lockValueFormatter struct {
 
 // Format implements the fmt.Formatter interface.
 func (m lockValueFormatter) Format(f fmt.State, c rune) {
-	fmt.Fprint(f, kvserver.SprintIntent(m.value))
+	fmt.Fprint(f, print.SprintIntent(m.value))
 }
 
 // pebbleToolFS is the vfs.FS that the pebble tool should use.

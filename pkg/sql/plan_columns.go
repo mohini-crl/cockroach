@@ -52,10 +52,14 @@ func getPlanColumns(plan planNode, mut bool) colinfo.ResultColumns {
 	case *renderNode:
 		return n.columns
 	case *scanNode:
-		return n.resultColumns
+		return n.columns
 	case *unionNode:
 		return n.columns
 	case *valuesNode:
+		return n.columns
+	case *vectorMutationSearchNode:
+		return n.columns
+	case *vectorSearchNode:
 		return n.columns
 	case *virtualTableNode:
 		return n.columns
@@ -67,7 +71,11 @@ func getPlanColumns(plan planNode, mut bool) colinfo.ResultColumns {
 		return n.columns
 	case *deleteNode:
 		return n.columns
+	case *deleteSwapNode:
+		return n.columns
 	case *updateNode:
+		return n.columns
+	case *updateSwapNode:
 		return n.columns
 	case *insertNode:
 		return n.columns
@@ -76,7 +84,7 @@ func getPlanColumns(plan planNode, mut bool) colinfo.ResultColumns {
 	case *upsertNode:
 		return n.columns
 	case *indexJoinNode:
-		return n.resultColumns
+		return n.columns
 	case *projectSetNode:
 		return n.columns
 	case *applyJoinNode:
@@ -90,7 +98,7 @@ func getPlanColumns(plan planNode, mut bool) colinfo.ResultColumns {
 	case *vTableLookupJoinNode:
 		return n.columns
 	case *invertedFilterNode:
-		return n.resultColumns
+		return n.columns
 	case *invertedJoinNode:
 		return n.columns
 	case *showFingerprintsNode:
@@ -169,9 +177,9 @@ func getPlanColumns(plan planNode, mut bool) colinfo.ResultColumns {
 			{Name: n.name, Typ: types.String},
 		}
 	case *rowSourceToPlanNode:
-		return n.planCols
+		return n.columns
 	case *cdcValuesNode:
-		return n.resultColumns
+		return n.columns
 
 	case *identifySystemNode:
 		return n.getColumns(mut, colinfo.IdentifySystemColumns)

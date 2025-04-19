@@ -1025,7 +1025,7 @@ func (u *sqlSymUnion) doBlockOption() tree.DoBlockOption {
 %token <str> LABEL LANGUAGE LAST LATERAL LATEST LC_CTYPE LC_COLLATE
 %token <str> LEADING LEASE LEAST LEAKPROOF LEFT LESS LEVEL LIKE LIMIT
 %token <str> LINESTRING LINESTRINGM LINESTRINGZ LINESTRINGZM
-%token <str> LIST LOCAL LOCALITY LOCALTIME LOCALTIMESTAMP LOCKED LOGICAL LOGICALLY LOGIN LOOKUP LOW LSHIFT
+%token <str> LIST LOCAL LOCALITY LOCALTIME LOCALTIMESTAMP LOCKED LOGGED LOGICAL LOGICALLY LOGIN LOOKUP LOW LSHIFT
 
 %token <str> MATCH MATERIALIZED MERGE MINVALUE MAXVALUE METHOD MINUTE MODIFYCLUSTERSETTING MODIFYSQLCLUSTERSETTING MODE MONTH MOVE
 %token <str> MULTILINESTRING MULTILINESTRINGM MULTILINESTRINGZ MULTILINESTRINGZM
@@ -1060,7 +1060,7 @@ func (u *sqlSymUnion) doBlockOption() tree.DoBlockOption {
 %token <str> SERIALIZABLE SERVER SERVICE SESSION SESSIONS SESSION_USER SET SETOF SETS SETTING SETTINGS
 %token <str> SHARE SHARED SHOW SIMILAR SIMPLE SIZE SKIP SKIP_LOCALITIES_CHECK SKIP_MISSING_FOREIGN_KEYS
 %token <str> SKIP_MISSING_SEQUENCES SKIP_MISSING_SEQUENCE_OWNERS SKIP_MISSING_VIEWS SKIP_MISSING_UDFS SMALLINT SMALLSERIAL
-%token <str> SNAPSHOT SOME SPLIT SQL SQLLOGIN
+%token <str> SNAPSHOT SOME SOURCE SPLIT SQL SQLLOGIN
 %token <str> STABLE START STATE STATEMENT STATISTICS STATUS STDIN STDOUT STOP STRAIGHT STREAM STRICT STRING STORAGE STORE STORED STORING SUBJECT SUBSTRING SUPER
 %token <str> SUPPORT SURVIVE SURVIVAL SYMMETRIC SYNTAX SYSTEM SQRT SUBSCRIPTION STATEMENTS
 
@@ -1150,6 +1150,7 @@ func (u *sqlSymUnion) doBlockOption() tree.DoBlockOption {
 %type <tree.Statement> alter_zone_table_stmt
 %type <tree.Statement> alter_table_set_schema_stmt
 %type <tree.Statement> alter_table_locality_stmt
+%type <tree.Statement> alter_table_logged_stmt
 %type <tree.Statement> alter_table_owner_stmt
 
 // ALTER VIRTUAL CLUSTER
@@ -1435,7 +1436,7 @@ func (u *sqlSymUnion) doBlockOption() tree.DoBlockOption {
 %type <[]tree.KVOption> kv_option_list opt_with_options var_set_list opt_with_schedule_options
 %type <*tree.BackupOptions> opt_with_backup_options backup_options backup_options_list
 %type <*tree.RestoreOptions> opt_with_restore_options restore_options restore_options_list
-%type <*tree.TenantReplicationOptions> opt_with_replication_options replication_options replication_options_list
+%type <*tree.TenantReplicationOptions> opt_with_replication_options replication_options replication_options_list source_replication_options source_replication_options_list
 %type <tree.ShowBackupDetails> show_backup_details
 %type <*tree.ShowJobOptions> show_job_options show_job_options_list
 %type <*tree.ShowBackupOptions> opt_with_show_backup_options show_backup_options show_backup_options_list
@@ -2012,6 +2013,7 @@ alter_table_stmt:
 | alter_rename_table_stmt
 | alter_table_set_schema_stmt
 | alter_table_locality_stmt
+| alter_table_logged_stmt
 | alter_table_owner_stmt
 // ALTER TABLE has its error help token here because the ALTER TABLE
 // prefix is spread over multiple non-terminals.
@@ -3061,7 +3063,6 @@ alter_table_cmd:
   }
 | table_rls_mode ROW LEVEL SECURITY
   {
-    /* SKIP DOC */
     $$.val = &tree.AlterTableSetRLSMode{
       Mode: $1.rlsTableMode(),
     }
@@ -3355,14 +3356,15 @@ alter_attribute_action:
 // %Help: REFRESH - recalculate a materialized view
 // %Category: Misc
 // %Text:
-// REFRESH MATERIALIZED VIEW [CONCURRENTLY] view_name [WITH [NO] DATA]
+// REFRESH MATERIALIZED VIEW [CONCURRENTLY] view_name [AS OF SYSTEM TIME <expr>>] [WITH [NO] DATA]
 refresh_stmt:
-  REFRESH MATERIALIZED VIEW opt_concurrently view_name opt_clear_data
+  REFRESH MATERIALIZED VIEW opt_concurrently view_name opt_as_of_clause opt_clear_data
   {
     $$.val = &tree.RefreshMaterializedView{
       Name: $5.unresolvedObjectName(),
       Concurrently: $4.bool(),
-      RefreshDataOption: $6.refreshDataOption(),
+      AsOf: $6.asOfClause(),
+      RefreshDataOption: $7.refreshDataOption(),
     }
   }
 | REFRESH error // SHOW HELP: REFRESH
@@ -4098,6 +4100,10 @@ restore_options:
   {
     $$.val = &tree.RestoreOptions{ExperimentalOnline: true}
   }
+| EXPERIMENTAL COPY
+{
+  $$.val = &tree.RestoreOptions{ExperimentalCopy: true}
+}
 | REMOVE_REGIONS
   {
     $$.val = &tree.RestoreOptions{RemoveRegions: true, SkipLocalitiesCheck: true}
@@ -4988,14 +4994,29 @@ replication_options:
   {
     $$.val = &tree.TenantReplicationOptions{Retention: $3.expr()}
   }
-|
-  EXPIRATION WINDOW '=' d_expr
-  {
-      $$.val = &tree.TenantReplicationOptions{ExpirationWindow: $4.expr()}
-  }
 | READ VIRTUAL CLUSTER
   {
     $$.val = &tree.TenantReplicationOptions{EnableReaderTenant: tree.MakeDBool(true)}
+  }
+
+source_replication_options_list:
+  // Require at least one option
+  source_replication_options
+  {
+    $$.val = $1.tenantReplicationOptions()
+  }
+| source_replication_options_list ',' source_replication_options
+  {
+    if err := $1.tenantReplicationOptions().CombineWith($3.tenantReplicationOptions()); err != nil {
+      return setErr(sqllex, err)
+    }
+  }
+
+  // List of valid tenant replication options.
+source_replication_options:
+  EXPIRATION WINDOW '=' d_expr
+  {
+      $$.val = &tree.TenantReplicationOptions{ExpirationWindow: $4.expr()}
   }
 
 // %Help: CREATE SCHEDULE
@@ -5042,7 +5063,6 @@ create_extension_stmt:
 alter_policy_stmt:
   ALTER POLICY name ON table_name RENAME TO name
   {
-    /* SKIP DOC */
     $$.val = &tree.AlterPolicy{
       PolicyName: tree.Name($3),
       TableName: $5.unresolvedObjectName(),
@@ -5051,7 +5071,6 @@ alter_policy_stmt:
   }
 | ALTER POLICY name ON table_name opt_policy_roles opt_policy_exprs
   {
-    /* SKIP DOC */
     $$.val = &tree.AlterPolicy{
       PolicyName: tree.Name($3),
       TableName: $5.unresolvedObjectName(),
@@ -5064,7 +5083,7 @@ alter_policy_stmt:
 // %Help: CREATE POLICY - define a new row-level security policy for a table
 // %Category: DDL
 // %Text:
-// CREATE POLICY name ON table_name
+// CREATE POLICY [IF NOT EXISTS] name ON table_name
 //     [ AS { PERMISSIVE | RESTRICTIVE } ]
 //     [ FOR { ALL | SELECT | INSERT | UPDATE | DELETE } ]
 //     [ TO { role_name | PUBLIC | CURRENT_USER | SESSION_USER } [, ...] ]
@@ -5075,14 +5094,26 @@ alter_policy_stmt:
 create_policy_stmt:
   CREATE POLICY name ON table_name opt_policy_type opt_policy_command opt_policy_roles opt_policy_exprs
   {
-    /* SKIP DOC */
     $$.val = &tree.CreatePolicy{
+      IfNotExists: false,
       PolicyName: tree.Name($3),
       TableName: $5.unresolvedObjectName(),
       Type: $6.policyType(),
       Cmd: $7.policyCommand(),
       Roles: $8.roleSpecList(),
       Exprs: $9.policyExpressions(),
+    }
+  }
+ | CREATE POLICY IF NOT EXISTS name ON table_name opt_policy_type opt_policy_command opt_policy_roles opt_policy_exprs
+  {
+    $$.val = &tree.CreatePolicy{
+      IfNotExists: true,
+      PolicyName: tree.Name($6),
+      TableName: $8.unresolvedObjectName(),
+      Type: $9.policyType(),
+      Cmd: $10.policyCommand(),
+      Roles: $11.roleSpecList(),
+      Exprs: $12.policyExpressions(),
     }
   }
  | CREATE POLICY error // SHOW HELP: CREATE POLICY
@@ -5096,7 +5127,6 @@ create_policy_stmt:
 drop_policy_stmt:
   DROP POLICY name ON table_name opt_drop_behavior
   {
-    /* SKIP DOC */
     $$.val = &tree.DropPolicy{
       PolicyName: tree.Name($3),
       TableName: $5.unresolvedObjectName(),
@@ -5106,7 +5136,6 @@ drop_policy_stmt:
   }
 | DROP POLICY IF EXISTS name ON table_name opt_drop_behavior
   {
-    /* SKIP DOC */
     $$.val = &tree.DropPolicy{
       PolicyName: tree.Name($5),
       TableName: $7.unresolvedObjectName(),
@@ -7328,6 +7357,19 @@ grant_stmt:
       WithGrantOption: $11.bool(),
     }
   }
+| GRANT privileges ON ALL ROUTINES IN SCHEMA schema_name_list TO role_spec_list opt_with_grant_option
+  {
+    $$.val = &tree.Grant{
+      Privileges: $2.privilegeList(),
+      Targets: tree.GrantTargetList{
+        Schemas: $8.objectNamePrefixList(),
+        AllFunctionsInSchema: true,
+        AllProceduresInSchema: true,
+      },
+      Grantees: $10.roleSpecList(),
+      WithGrantOption: $11.bool(),
+    }
+  }
 | GRANT SYSTEM privileges TO role_spec_list opt_with_grant_option
   {
     $$.val = &tree.Grant{
@@ -7486,6 +7528,32 @@ revoke_stmt:
       Privileges: $5.privilegeList(),
       Targets: tree.GrantTargetList{
         Schemas: $11.objectNamePrefixList(),
+        AllProceduresInSchema: true,
+      },
+      Grantees: $13.roleSpecList(),
+      GrantOptionFor: true,
+    }
+  }
+| REVOKE privileges ON ALL ROUTINES IN SCHEMA schema_name_list FROM role_spec_list
+  {
+    $$.val = &tree.Revoke{
+      Privileges: $2.privilegeList(),
+      Targets: tree.GrantTargetList{
+        Schemas: $8.objectNamePrefixList(),
+        AllFunctionsInSchema: true,
+        AllProceduresInSchema: true,
+      },
+      Grantees: $10.roleSpecList(),
+      GrantOptionFor: false,
+    }
+  }
+| REVOKE GRANT OPTION FOR privileges ON ALL ROUTINES IN SCHEMA schema_name_list FROM role_spec_list
+  {
+    $$.val = &tree.Revoke{
+      Privileges: $5.privilegeList(),
+      Targets: tree.GrantTargetList{
+        Schemas: $11.objectNamePrefixList(),
+        AllFunctionsInSchema: true,
         AllProceduresInSchema: true,
       },
       Grantees: $13.roleSpecList(),
@@ -7823,6 +7891,7 @@ alter_virtual_cluster_service_stmt:
 // ALTER VIRTUAL CLUSTER <virtual_cluster_spec> COMPLETE REPLICATION TO LATEST
 // ALTER VIRTUAL CLUSTER <virtual_cluster_spec> COMPLETE REPLICATION TO SYSTEM TIME 'time'
 // ALTER VIRTUAL CLUSTER <virtual_cluster_spec> SET REPLICATION opt=value,...
+// ALTER VIRTUAL CLUSTER <virtual_cluster_spec> SET SOURCE REPLICATION opt=value,...
 alter_virtual_cluster_replication_stmt:
   ALTER virtual_cluster virtual_cluster_spec PAUSE REPLICATION
   {
@@ -7866,6 +7935,15 @@ alter_virtual_cluster_replication_stmt:
     $$.val = &tree.AlterTenantReplication{
       TenantSpec: $3.tenantSpec(),
       Options: *$6.tenantReplicationOptions(),
+    }
+  }
+| ALTER virtual_cluster virtual_cluster_spec SET REPLICATION SOURCE source_replication_options_list
+  {
+    /* SKIP DOC */
+    $$.val = &tree.AlterTenantReplication{
+      TenantSpec: $3.tenantSpec(),
+      Producer: true,
+      Options: *$7.tenantReplicationOptions(),
     }
   }
 | ALTER virtual_cluster virtual_cluster_spec START REPLICATION OF d_expr ON d_expr opt_with_replication_options
@@ -9715,6 +9793,10 @@ opt_show_create_format_options:
 | WITH REDACT
   {
     $$.val = tree.ShowCreateFormatOptionRedactedValues
+  }
+| WITH IGNORE_FOREIGN_KEYS
+  {
+    $$.val = tree.ShowCreateFormatOptionIgnoreFKs
   }
 
 // %Help: SHOW CREATE SCHEDULES - list CREATE statements for scheduled jobs
@@ -12566,6 +12648,40 @@ locality:
     }
   }
 
+alter_table_logged_stmt:
+  ALTER TABLE relation_expr SET LOGGED
+  {
+    $$.val = &tree.AlterTableSetLogged{
+      Name: $3.unresolvedObjectName(),
+      IsLogged: true,
+      IfExists: false,
+    }
+  }
+| ALTER TABLE IF EXISTS relation_expr SET LOGGED
+  {
+    $$.val = &tree.AlterTableSetLogged{
+      Name: $5.unresolvedObjectName(),
+      IsLogged: true,
+      IfExists: true,
+    }
+  }
+| ALTER TABLE relation_expr SET UNLOGGED
+  {
+    $$.val = &tree.AlterTableSetLogged{
+      Name: $3.unresolvedObjectName(),
+      IsLogged: false,
+      IfExists: false,
+    }
+  }
+| ALTER TABLE IF EXISTS relation_expr SET UNLOGGED
+  {
+    $$.val = &tree.AlterTableSetLogged{
+      Name: $5.unresolvedObjectName(),
+      IsLogged: false,
+      IfExists: true,
+    }
+  }
+
 alter_table_owner_stmt:
   ALTER TABLE relation_expr OWNER TO role_spec
   {
@@ -12860,9 +12976,9 @@ target_object_type:
   {
     $$.val = privilege.Routines
   }
-| ROUTINES error
+| ROUTINES
   {
-    return unimplemented(sqllex, "ALTER DEFAULT PRIVILEGES ... ON ROUTINES ...")
+    $$.val = privilege.Routines
   }
 
 opt_for_roles:
@@ -18221,6 +18337,7 @@ unreserved_keyword:
 | LOGICALLY
 | LOGIN
 | LOCALITY
+| LOGGED
 | LOOKUP
 | LOW
 | MATCH
@@ -18413,6 +18530,7 @@ unreserved_keyword:
 | SKIP_MISSING_SEQUENCE_OWNERS
 | SKIP_MISSING_VIEWS
 | SKIP_MISSING_UDFS
+| SOURCE
 | SNAPSHOT
 | SPLIT
 | SQL
@@ -18788,6 +18906,7 @@ bare_label_keywords:
 | LOCALTIME
 | LOCALTIMESTAMP
 | LOCKED
+| LOGGED
 | LOGICAL
 | LOGICALLY
 | LOGIN
@@ -19004,6 +19123,7 @@ bare_label_keywords:
 | SMALLINT
 | SNAPSHOT
 | SOME
+| SOURCE
 | SPLIT
 | SQL
 | SQLLOGIN

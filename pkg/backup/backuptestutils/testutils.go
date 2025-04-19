@@ -18,10 +18,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/keyvisualizer"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
+	"github.com/cockroachdb/cockroach/pkg/upgrade/upgradebase"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/metamorphic"
 	"github.com/cockroachdb/cockroach/pkg/workload/bank"
@@ -133,7 +133,18 @@ func StartBackupRestoreTestCluster(
 	tc := testcluster.StartTestCluster(t, clusterSize, opts.testClusterArgs)
 	opts.initFunc(tc)
 
+	// Disable autocommit before DDLs in order to make schema changes during test
+	// setup faster. Becuase the cluster setting only enacts on new conns in
+	// the pool, temprorarily reduce the number of max open conns to 1, and apply
+	// the session var to the existing conn.
+	for i := 0; i < clusterSize; i++ {
+		tc.Conns[i].SetMaxOpenConns(1)
+		_, err := tc.Conns[i].Exec("SET autocommit_before_ddl = false")
+		require.NoError(t, err)
+		tc.Conns[i].SetMaxOpenConns(0)
+	}
 	sqlDB := sqlutils.MakeSQLRunner(tc.Conns[0])
+	sqlDB.Exec(t, `SET CLUSTER SETTING sql.defaults.autocommit_before_ddl.enabled = 'false'`)
 
 	if opts.bankArgs != nil {
 		const payloadSize = 100
@@ -149,12 +160,6 @@ func StartBackupRestoreTestCluster(
 		// monitor.
 		sqlDB.Exec(t, `SET CLUSTER SETTING kv.bulk_ingest.pk_buffer_size = '16MiB'`)
 		sqlDB.Exec(t, `SET CLUSTER SETTING kv.bulk_ingest.index_buffer_size = '16MiB'`)
-
-		// Set the max buffer size to something low to prevent
-		// backup/restore tests from hitting OOM errors. If any test
-		// cares about this setting in particular, they will override
-		// it inline after setting up the test cluster.
-		sqlDB.Exec(t, `SET CLUSTER SETTING bulkio.backup.merge_file_buffer_size = '16MiB'`)
 
 		sqlDB.Exec(t, `CREATE DATABASE data`)
 		l := workloadsql.InsertsDataLoader{BatchSize: 1000, Concurrency: 4}
@@ -211,8 +216,8 @@ func setTestClusterDefaults(params *base.TestClusterArgs, dataDir string, useDat
 			SkipZoneConfigBootstrap: true,
 		}
 	}
-	if params.ServerArgs.Knobs.SQLStatsKnobs == nil {
-		params.ServerArgs.Knobs.SQLStatsKnobs = &sqlstats.TestingKnobs{
+	if params.ServerArgs.Knobs.UpgradeManager == nil {
+		params.ServerArgs.Knobs.UpgradeManager = &upgradebase.TestingKnobs{
 			SkipZoneConfigBootstrap: true,
 		}
 	}

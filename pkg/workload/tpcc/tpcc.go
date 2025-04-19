@@ -9,6 +9,7 @@ import (
 	"context"
 	gosql "database/sql"
 	"fmt"
+	"math/rand/v2"
 	"os"
 	"regexp"
 	"strconv"
@@ -30,7 +31,7 @@ import (
 	"github.com/cockroachdb/errors"
 	"github.com/jackc/pgx/v5"
 	"github.com/spf13/pflag"
-	"golang.org/x/exp/rand"
+	randold "golang.org/x/exp/rand"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -246,6 +247,7 @@ var tpccMeta = workload.Meta{
 		g.flags.Meta = map[string]workload.FlagMeta{
 			`mix`:                      {RuntimeOnly: true},
 			`partitions`:               {RuntimeOnly: true},
+			`ignore-partitions`:        {RuntimeOnly: true},
 			`client-partitions`:        {RuntimeOnly: true},
 			`partition-affinity`:       {RuntimeOnly: true},
 			`partition-strategy`:       {RuntimeOnly: true},
@@ -443,7 +445,14 @@ func (w *tpcc) Hooks() workload.Hooks {
 				if w.waitFraction == 0 {
 					w.numConns = w.workers
 				} else {
-					w.numConns = w.activeWarehouses * numConnsPerWarehouse
+					partitionFactor := 1
+					countAffinity := len(w.affinityPartitions)
+					if countAffinity > 0 && w.partitions > 0 {
+						partitionFactor = w.partitions / countAffinity
+					}
+
+					w.numConns = (w.activeWarehouses * numConnsPerWarehouse)
+					w.numConns = w.numConns / partitionFactor
 				}
 			}
 
@@ -650,21 +659,33 @@ func (w *tpcc) Hooks() workload.Hooks {
 // Tables implements the Generator interface.
 func (w *tpcc) Tables() []workload.Table {
 	seed := RandomSeed.Seed()
-	aCharsInit := workloadimpl.PrecomputedRandInit(rand.New(rand.NewSource(seed)), precomputedLength, aCharsAlphabet)
-	lettersInit := workloadimpl.PrecomputedRandInit(rand.New(rand.NewSource(seed)), precomputedLength, lettersAlphabet)
-	numbersInit := workloadimpl.PrecomputedRandInit(rand.New(rand.NewSource(seed)), precomputedLength, numbersAlphabet)
+	aCharsInit := workloadimpl.PrecomputedRandInit(rand.NewPCG(seed, 0), precomputedLength, aCharsAlphabet)
+	lettersInit := workloadimpl.PrecomputedRandInit(rand.NewPCG(seed, 0), precomputedLength, lettersAlphabet)
+	numbersInit := workloadimpl.PrecomputedRandInit(rand.NewPCG(seed, 0), precomputedLength, numbersAlphabet)
+	aCharsInitOld := workloadimpl.PrecomputedRandInit(randold.New(randold.NewSource(seed)), precomputedLength, aCharsAlphabet)
+	lettersInitOld := workloadimpl.PrecomputedRandInit(randold.New(randold.NewSource(seed)), precomputedLength, lettersAlphabet)
+	numbersInitOld := workloadimpl.PrecomputedRandInit(randold.New(randold.NewSource(seed)), precomputedLength, numbersAlphabet)
 	if w.localsPool == nil {
 		w.localsPool = &sync.Pool{
 			New: func() interface{} {
 				return &generateLocals{
 					rng: tpccRand{
-						Rand: rand.New(rand.NewSource(uint64(timeutil.Now().UnixNano()))),
+						Rand: rand.New(rand.NewPCG(rand.Uint64(), rand.Uint64())),
 						// Intentionally wait until here to initialize the precomputed rands
 						// so a caller of Tables that only wants schema doesn't compute
 						// them.
 						aChars:  aCharsInit(),
 						letters: lettersInit(),
 						numbers: numbersInit(),
+					},
+					rngOld: tpccRandOld{
+						Rand: randold.New(randold.NewSource(uint64(timeutil.Now().UnixNano()))),
+						// Intentionally wait until here to initialize the precomputed rands
+						// so a caller of Tables that only wants schema doesn't compute
+						// them.
+						aChars:  aCharsInitOld(),
+						letters: lettersInitOld(),
+						numbers: numbersInitOld(),
 					},
 				}
 			},
@@ -895,6 +916,7 @@ func (w *tpcc) Ops(
 	// Limit the number of connections per pool (otherwise preparing statements at
 	// startup can be slow).
 	cfg.MaxConnsPerPool = w.connFlags.Concurrency
+	fmt.Printf("Max Total connections %d Max connections per pool %d \n", cfg.MaxTotalConnections, cfg.MaxConnsPerPool)
 	fmt.Printf("Initializing %d connections...\n", w.numConns)
 
 	// If queries were specified before each operation, then lets

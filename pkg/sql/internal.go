@@ -181,7 +181,7 @@ func MakeInternalExecutorMemMonitor(
 	memMetrics MemoryMetrics, settings *cluster.Settings,
 ) *mon.BytesMonitor {
 	return mon.NewMonitor(mon.Options{
-		Name:       mon.MakeMonitorName("internal SQL executor"),
+		Name:       mon.MakeName("internal SQL executor"),
 		CurCount:   memMetrics.CurBytesCount,
 		MaxHist:    memMetrics.MaxBytesHist,
 		Settings:   settings,
@@ -303,7 +303,7 @@ func (ie *InternalExecutor) initConnEx(
 	}
 	clientComm.rowsAffectedState.numRewindsLimit = ieRowsAffectedRetryLimit.Get(&ie.s.cfg.Settings.SV)
 
-	applicationStats := ie.s.sqlStats.GetApplicationStats(sd.ApplicationName)
+	applicationStats := ie.s.localSqlStats.GetApplicationStats(sd.ApplicationName)
 	sds := sessiondata.NewStack(sd)
 	defaults := SessionDefaults(map[string]string{
 		"application_name": sd.ApplicationName,
@@ -477,6 +477,9 @@ func (ie *InternalExecutor) newConnExecutorWithTxn(
 		ex.QualityOfService(),
 		isolation.Serializable,
 		txn.GetOmitInRangefeeds(),
+		// TODO(yuzefovich): re-evaluate whether we want to allow buffered
+		// writes for internal executor.
+		false, /* bufferedWritesEnabled */
 	)
 
 	// Modify the Collection to match the parent executor's Collection.
@@ -959,6 +962,13 @@ func applyOverrides(o sessiondata.InternalExecutorOverride, sd *sessiondata.Sess
 	if o.DisablePlanGists {
 		sd.DisablePlanGists = true
 	}
+	if o.BufferedWritesEnabled != nil {
+		sd.BufferedWritesEnabled = *o.BufferedWritesEnabled
+	}
+	// For 25.2, we're being conservative and explicitly disabling buffered
+	// writes for the internal executor.
+	// TODO(yuzefovich): remove this for 25.3.
+	sd.BufferedWritesEnabled = false
 
 	if o.MultiOverride != "" {
 		overrides := strings.Split(o.MultiOverride, ",")

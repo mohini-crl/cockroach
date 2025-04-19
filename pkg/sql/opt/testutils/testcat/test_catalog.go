@@ -43,7 +43,8 @@ import (
 
 const (
 	// testDB is the default current database for testing purposes.
-	testDB = "t"
+	testDB       = "t"
+	testSchemaID = 1
 )
 
 // Catalog implements the cat.Catalog interface for testing purposes.
@@ -78,7 +79,7 @@ func New() *Catalog {
 
 	return &Catalog{
 		testSchema: Schema{
-			SchemaID: 1,
+			SchemaID: testSchemaID,
 			SchemaName: cat.SchemaName{
 				CatalogName:     testDB,
 				SchemaName:      catconstants.PublicSchemaName,
@@ -133,6 +134,17 @@ func (tc *Catalog) ResolveSchema(
 	toResolve.CatalogName = tree.Name(testDB)
 	toResolve.SchemaName = catconstants.PublicSchemaName
 	return tc.resolveSchema(&toResolve)
+}
+
+// ResolveSchemaByID is part of the cat.Catalog interface.
+func (tc *Catalog) ResolveSchemaByID(
+	_ context.Context, _ cat.Flags, id cat.StableID,
+) (cat.Schema, error) {
+	if id != testSchemaID {
+		return nil, pgerror.Newf(pgcode.InvalidSchemaName,
+			"target database or schema does not exist")
+	}
+	return &tc.testSchema, nil
 }
 
 // GetAllSchemaNamesForDB is part of the cat.Catalog interface.
@@ -319,9 +331,14 @@ func (tc *Catalog) CheckExecutionPrivilege(
 
 // HasAdminRole is part of the cat.Catalog interface.
 func (tc *Catalog) HasAdminRole(ctx context.Context) (bool, error) {
-	roleMembership, found := tc.users[tc.currentUser]
+	return tc.UserHasAdminRole(ctx, tc.currentUser)
+}
+
+// UserHasAdminRole is part of the cat.Catalog interface.
+func (tc *Catalog) UserHasAdminRole(ctx context.Context, user username.SQLUsername) (bool, error) {
+	roleMembership, found := tc.users[user]
 	if !found {
-		return false, errors.AssertionFailedf("user %q not found", tc.currentUser)
+		return false, errors.AssertionFailedf("user %q not found", user)
 	}
 	return roleMembership.isMemberOfAdminRole, nil
 }
@@ -329,6 +346,13 @@ func (tc *Catalog) HasAdminRole(ctx context.Context) (bool, error) {
 // HasRoleOption is part of the cat.Catalog interface.
 func (tc *Catalog) HasRoleOption(ctx context.Context, roleOption roleoption.Option) (bool, error) {
 	return true, nil
+}
+
+// UserHasGlobalPrivilegeOrRoleOption is part of the cat.Catalog interface.
+func (tc *Catalog) UserHasGlobalPrivilegeOrRoleOption(
+	ctx context.Context, privilege privilege.Kind, user username.SQLUsername,
+) (bool, error) {
+	return false, nil
 }
 
 // FullyQualifiedName is part of the cat.Catalog interface.
@@ -358,6 +382,18 @@ func (tc *Catalog) GetRoutineOwner(
 	ctx context.Context, routineOid oid.Oid,
 ) (username.SQLUsername, error) {
 	return tc.GetCurrentUser(), nil
+}
+
+// IsOwner is part of the cat.Catalog interface.
+func (tc *Catalog) IsOwner(
+	ctx context.Context, o cat.Object, user username.SQLUsername,
+) (bool, error) {
+	switch t := o.(type) {
+	case *Table:
+		return t.Owner == user, nil
+	default:
+		panic(errors.AssertionFailedf("type %T is not supported in IsOwner()", t))
+	}
 }
 
 func (tc *Catalog) resolveSchema(toResolve *cat.SchemaName) (cat.Schema, cat.SchemaName, error) {
@@ -477,7 +513,13 @@ func (tc *Catalog) GetDependencyDigest() cat.DependencyDigest {
 	tc.dependencyDigest++
 	return cat.DependencyDigest{
 		LeaseGeneration: tc.dependencyDigest,
+		CurrentUser:     tc.currentUser,
 	}
+}
+
+// LeaseByStableID does not do anything since no leasing is used here.
+func (tc *Catalog) LeaseByStableID(ctx context.Context, id cat.StableID) (uint64, error) {
+	return 1, nil
 }
 
 // ExecuteMultipleDDL parses the given semicolon-separated DDL SQL statements
@@ -549,6 +591,10 @@ func (tc *Catalog) executeDDLStmtWithIndexVersion(
 
 	case *tree.AlterTable:
 		tc.AlterTable(stmt)
+		return "", nil
+
+	case *tree.AlterTableOwner:
+		tc.AlterTableOwner(stmt)
 		return "", nil
 
 	case *tree.DropTable:
@@ -679,6 +725,11 @@ func (s *Schema) ID() cat.StableID {
 	return s.SchemaID
 }
 
+// Version is a part of cat.Object
+func (s *Schema) Version() uint64 {
+	return 1
+}
+
 // PostgresDescriptorID is part of the cat.Object interface.
 func (s *Schema) PostgresDescriptorID() catid.DescID {
 	return catid.DescID(s.SchemaID)
@@ -735,6 +786,11 @@ func (tv *View) String() string {
 // ID is part of the cat.DataSource interface.
 func (tv *View) ID() cat.StableID {
 	return tv.ViewID
+}
+
+// Version is a part of cat.Object
+func (tv *View) Version() uint64 {
+	return 1
 }
 
 // PostgresDescriptorID is part of the cat.Object interface.
@@ -800,6 +856,7 @@ func (tv *View) Trigger(i int) cat.Trigger {
 type Table struct {
 	TabID      cat.StableID
 	DatabaseID descpb.ID
+	SchemaID   descpb.ID
 	TabVersion int
 	TabName    tree.TableName
 	Columns    []cat.Column
@@ -811,6 +868,7 @@ type Table struct {
 	IsVirtual  bool
 	IsSystem   bool
 	Catalog    *Catalog
+	Owner      username.SQLUsername
 
 	// If Revoked is true, then the user has had privileges on the table revoked.
 	Revoked bool
@@ -833,8 +891,10 @@ type Table struct {
 
 	homeRegion string
 
-	rlsEnabled bool
-	policies   cat.Policies
+	rlsEnabled   bool
+	rlsForced    bool
+	policies     cat.Policies
+	nextPolicyID descpb.PolicyID
 }
 
 var _ cat.Table = &Table{}
@@ -855,6 +915,11 @@ func (tt *Table) SetMultiRegion(val bool) {
 // ID is part of the cat.DataSource interface.
 func (tt *Table) ID() cat.StableID {
 	return tt.TabID
+}
+
+// Version is a part of cat.Object
+func (tt *Table) Version() uint64 {
+	return 1
 }
 
 // PostgresDescriptorID is part of the cat.Object interface.
@@ -1033,9 +1098,25 @@ func (tt *Table) GetDatabaseID() descpb.ID {
 	return tt.DatabaseID
 }
 
+// GetSchemaID is part of the cat.Table interface.
+func (tt *Table) GetSchemaID() descpb.ID {
+	return tt.SchemaID
+}
+
 // IsHypothetical is part of the cat.Table interface.
 func (tt *Table) IsHypothetical() bool {
 	return false
+}
+
+// LookupColumnOrdinal is part of the cat.Table interface.
+func (tt *Table) LookupColumnOrdinal(colID descpb.ColumnID) (int, error) {
+	for i, col := range tt.Columns {
+		if descpb.ColumnID(col.ColID()) == colID {
+			return i, nil
+		}
+	}
+	return 0, pgerror.Newf(pgcode.UndefinedColumn,
+		"column [%d] does not exist", colID)
 }
 
 // FindOrdinal returns the ordinal of the column with the given name.
@@ -1113,44 +1194,59 @@ func (tt *Table) Trigger(i int) cat.Trigger {
 // IsRowLevelSecurityEnabled is part of the cat.Table interface.
 func (tt *Table) IsRowLevelSecurityEnabled() bool { return tt.rlsEnabled }
 
-// PolicyCount is part of the cat.Table interface
-func (tt *Table) PolicyCount(polType tree.PolicyType) int {
-	switch polType {
-	case tree.PolicyTypeRestrictive:
-		return len(tt.policies.Restrictive)
-	default:
-		return len(tt.policies.Permissive)
-	}
-}
+// IsRowLevelSecurityForced is part of the cat.Table interface.
+func (tt *Table) IsRowLevelSecurityForced() bool { return tt.rlsForced }
 
-// Policy is part of the cat.Table interface
-func (tt *Table) Policy(policyType tree.PolicyType, index int) cat.Policy {
-	var policies []cat.Policy
-	switch policyType {
-	case tree.PolicyTypeRestrictive:
-		policies = tt.policies.Restrictive
-	default:
-		policies = tt.policies.Permissive
-	}
-	if index >= len(policies) {
-		panic(errors.AssertionFailedf("policy of type %v at index %d not found", policyType, index))
-	}
-	return policies[index]
+// Policies is part of the cat.Table interface.
+func (tt *Table) Policies() *cat.Policies {
+	return &tt.policies
 }
 
 // findPolicyByName will lookup the policy by its name. It returns it's policy
 // type and index within that policy type slice so that callers can do removal
 // if needed.
 func (tt *Table) findPolicyByName(policyName tree.Name) (*cat.Policy, tree.PolicyType, int) {
-	for _, pt := range []tree.PolicyType{tree.PolicyTypePermissive, tree.PolicyTypeRestrictive} {
-		for i := range tt.PolicyCount(pt) {
-			p := tt.Policy(pt, i)
-			if p.Name == policyName {
-				return &p, pt, i
-			}
+	for i, p := range tt.policies.Permissive {
+		if p.Name == policyName {
+			return &p, tree.PolicyTypePermissive, i
+		}
+	}
+	for i, p := range tt.policies.Restrictive {
+		if p.Name == policyName {
+			return &p, tree.PolicyTypeRestrictive, i
 		}
 	}
 	return nil, tree.PolicyTypePermissive, -1
+}
+
+// addRLSConstraint will add a special constraint in the table to enforce
+// policies for new rows.
+func (tt *Table) addRLSConstraint() {
+	if tt.findRLSConstraint() >= 0 {
+		panic(errors.AssertionFailedf("table already has an RLS constraint"))
+	}
+	tt.Checks = append(tt.Checks, &CheckConstraint{
+		isRLSConstraint: true,
+	})
+}
+
+// removeRLSConstraint will remove the special row-level constraint in the table.
+func (tt *Table) removeRLSConstraint() {
+	i := tt.findRLSConstraint()
+	if i < 0 {
+		panic(errors.AssertionFailedf("table does not have the RLS constraint to remove"))
+	}
+	tt.Checks = append(tt.Checks[:i], tt.Checks[i+1:]...)
+}
+
+// findRLSConstraint returns the index in tt.Checks of the RLS constraint.
+func (tt *Table) findRLSConstraint() int {
+	for i := range tt.Checks {
+		if tt.Checks[i].IsRLSConstraint() {
+			return i
+		}
+	}
+	return -1
 }
 
 // Index implements the cat.Index interface for testing purposes.
@@ -1356,6 +1452,10 @@ func (ti *Index) Partition(i int) cat.Partition {
 	return &ti.partitions[i]
 }
 
+func (ti *Index) IsTemporaryIndexForBackfill() bool {
+	return false
+}
+
 // SetPartitions manually sets the partitions.
 func (ti *Index) SetPartitions(partitions []Partition) {
 	ti.partitions = partitions
@@ -1393,9 +1493,10 @@ func (p *Partition) SetDatums(datums []tree.Datums) {
 // CheckConstraint implements cat.CheckConstraint. See that interface
 // for more information on the fields.
 type CheckConstraint struct {
-	constraint     string
-	validated      bool
-	columnOrdinals []int
+	constraint      string
+	validated       bool
+	columnOrdinals  []int
+	isRLSConstraint bool
 }
 
 var _ cat.CheckConstraint = &CheckConstraint{}
@@ -1419,6 +1520,9 @@ func (c *CheckConstraint) ColumnCount() int {
 func (c *CheckConstraint) ColumnOrdinal(i int) int {
 	return c.columnOrdinals[i]
 }
+
+// IsRLSConstraint is part of the cat.CheckConstraint interface.
+func (c *CheckConstraint) IsRLSConstraint() bool { return c.isRLSConstraint }
 
 // TableStat implements the cat.TableStatistic interface for testing purposes.
 type TableStat struct {
@@ -1748,6 +1852,11 @@ var _ cat.Sequence = &Sequence{}
 // ID is part of the cat.DataSource interface.
 func (ts *Sequence) ID() cat.StableID {
 	return ts.SeqID
+}
+
+// Version is a part of cat.Object
+func (ts *Sequence) Version() uint64 {
+	return 1
 }
 
 // PostgresDescriptorID is part of the cat.Object interface.

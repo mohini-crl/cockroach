@@ -80,12 +80,14 @@ func (tc *Catalog) CreateTable(stmt *tree.CreateTable) *Table {
 		isRbr = stmt.Locality.LocalityLevel == tree.LocalityLevelRow
 		isRbt = stmt.Locality.LocalityLevel == tree.LocalityLevelTable
 	}
-	tab := &Table{TabID: tc.nextStableID(), TabName: stmt.Table, Catalog: tc}
+	tab := &Table{TabID: tc.nextStableID(), SchemaID: testSchemaID, TabName: stmt.Table, Catalog: tc}
 
 	if isRbt && stmt.Locality.TableRegion != "" {
 		tab.multiRegion = true
 		tab.homeRegion = string(stmt.Locality.TableRegion)
 	}
+
+	tab.nextPolicyID = 1
 
 	if isRbr && stmt.PartitionByTable == nil {
 		// Build the table as LOCALITY REGIONAL BY ROW.
@@ -488,7 +490,13 @@ func (tc *Catalog) CreateTableAs(name tree.TableName, columns []cat.Column) *Tab
 	// Update the table name to include catalog and schema if not provided.
 	tc.qualifyTableName(&name)
 
-	tab := &Table{TabID: tc.nextStableID(), TabName: name, Catalog: tc, Columns: columns}
+	tab := &Table{
+		TabID:    tc.nextStableID(),
+		SchemaID: testSchemaID,
+		TabName:  name,
+		Catalog:  tc,
+		Columns:  columns,
+	}
 
 	var rowid cat.Column
 	ordinal := len(columns)
@@ -509,6 +517,7 @@ func (tc *Catalog) CreateTableAs(name tree.TableName, columns []cat.Column) *Tab
 
 	tab.Columns = append(tab.Columns, rowid)
 	tab.addPrimaryColumnIndex("rowid")
+	tab.Owner = tc.currentUser
 
 	// Add the new table to the catalog.
 	tc.AddTable(tab)
@@ -1391,7 +1400,7 @@ func (ti *Index) partitionByListExprToDatums(
 	d := make(tree.Datums, len(vals))
 	for i := range vals {
 		c := tree.CastExpr{Expr: vals[i], Type: ti.Columns[i].DatumType()}
-		cTyped, err := c.TypeCheck(ctx, semaCtx, types.Any)
+		cTyped, err := c.TypeCheck(ctx, semaCtx, types.AnyElement)
 		if err != nil {
 			panic(err)
 		}

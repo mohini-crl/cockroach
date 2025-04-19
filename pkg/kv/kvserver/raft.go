@@ -166,12 +166,9 @@ func logRaftReady(ctx context.Context, ready raft.Ready) {
 		fmt.Fprintf(&buf, "  New Entry[%d]: %.200s\n",
 			i, raft.DescribeEntry(e, raftEntryFormatter))
 	}
-	for i, e := range ready.CommittedEntries {
-		fmt.Fprintf(&buf, "  Committed Entry[%d]: %.200s\n",
-			i, raft.DescribeEntry(e, raftEntryFormatter))
-	}
-	if !raft.IsEmptySnap(ready.Snapshot) {
-		snap := ready.Snapshot
+	fmt.Fprintf(&buf, "  Committed: %v\n", ready.Committed)
+	if ready.Snapshot != nil {
+		snap := *ready.Snapshot
 		snap.Data = nil
 		fmt.Fprintf(&buf, "  Snapshot updated: %v\n", snap)
 	}
@@ -179,7 +176,7 @@ func logRaftReady(ctx context.Context, ready raft.Ready) {
 		fmt.Fprintf(&buf, "  Outgoing Message[%d]: %.200s\n",
 			i, raft.DescribeMessage(m, raftEntryFormatter))
 	}
-	log.Infof(ctx, "raft ready (must-sync=%t)\n%s", ready.MustSync, buf.String())
+	log.Infof(ctx, "raft ready\n%s", buf.String())
 }
 
 func raftEntryFormatter(data []byte) string {

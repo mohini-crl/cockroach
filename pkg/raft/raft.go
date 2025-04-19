@@ -39,20 +39,9 @@ import (
 	"golang.org/x/exp/maps"
 )
 
-const (
-	// None is a placeholder node ID used when there is no leader.
-	//
-	// TODO(arul): consider pulling these into raftpb as well.
-	None pb.PeerID = 0
-	// LocalAppendThread is a reference to a local thread that saves unstable
-	// log entries and snapshots to stable storage. The identifier is used as a
-	// target for MsgStorageAppend messages when AsyncStorageWrites is enabled.
-	LocalAppendThread pb.PeerID = math.MaxUint64
-	// LocalApplyThread is a reference to a local thread that applies committed
-	// log entries to the local state machine. The identifier is used as a
-	// target for MsgStorageApply messages when AsyncStorageWrites is enabled.
-	LocalApplyThread pb.PeerID = math.MaxUint64 - 1
-)
+// None is a placeholder node ID used when there is no leader.
+// TODO(arul): consider pulling these into raftpb as well.
+const None pb.PeerID = 0
 
 // Possible values for CampaignType
 const (
@@ -105,6 +94,10 @@ type Config struct {
 	// HeartbeatTick. We suggest ElectionTick = 10 * HeartbeatTick to avoid
 	// unnecessary leader switching.
 	ElectionTick int64
+	// ElectionJitter is the maximum number of ticks that a follower will wait
+	// after ElectionTick before starting an election. It is used to prevent hung
+	// elections in the case where multiple followers campaign at the same time.
+	ElectionJitterTick int64
 	// HeartbeatTick is the number of Node.Tick invocations that must pass between
 	// heartbeats. That is, a leader sends heartbeat messages to maintain its
 	// leadership every HeartbeatTick ticks.
@@ -155,9 +148,9 @@ type Config struct {
 	// threads are not responsible for understanding the response messages, only
 	// for delivering them to the correct target after performing the storage
 	// write.
-	// TODO(#129411): deprecate !AsyncStorageWrites mode as it's not used in
-	// CRDB.
-	AsyncStorageWrites bool
+	// TODO(pav-kv): this comment is a remnant of the AsyncStorageWrites option,
+	// which is now implicitly always true. Move the comment to a better place.
+
 	// LazyReplication instructs raft to hold off constructing MsgApp messages
 	// eagerly in reaction to Step() calls.
 	//
@@ -181,7 +174,8 @@ type Config struct {
 	//
 	// Despite its name (preserved for compatibility), this quota applies across
 	// Ready structs to encompass all outstanding entries in unacknowledged
-	// MsgStorageApply messages when AsyncStorageWrites is enabled.
+	// MsgStorageApply messages.
+	// TODO(pav-kv): make the name better.
 	MaxCommittedSizePerReady uint64
 	// MaxUncommittedEntriesSize limits the aggregate byte size of the
 	// uncommitted entries that may be appended to a leader's log. Once this
@@ -250,26 +244,20 @@ type Config struct {
 	// See: https://github.com/etcd-io/raft/issues/80
 	DisableConfChangeValidation bool
 
-	// TestingDisablePreCampaignStoreLivenessCheck may be used by tests to disable
-	// the check performed by a peer before campaigning to ensure it has
-	// StoreLiveness support from a majority quorum.
-	TestingDisablePreCampaignStoreLivenessCheck bool
-
 	// StoreLiveness is a reference to the store liveness fabric.
 	StoreLiveness raftstoreliveness.StoreLiveness
 
 	// CRDBVersion exposes the active version to Raft. This helps version-gating
 	// features.
 	CRDBVersion clusterversion.Handle
-	Metrics     *Metrics
+
+	Metrics      *Metrics
+	TestingKnobs *TestingKnobs
 }
 
 func (c *Config) validate() error {
 	if c.ID == None {
 		return errors.New("cannot use none as id")
-	}
-	if IsLocalMsgTarget(c.ID) {
-		return errors.New("cannot use local target as id")
 	}
 
 	if c.HeartbeatTick <= 0 {
@@ -278,6 +266,10 @@ func (c *Config) validate() error {
 
 	if c.ElectionTick <= c.HeartbeatTick {
 		return errors.New("election tick must be greater than heartbeat tick")
+	}
+
+	if c.ElectionJitterTick <= 0 {
+		return errors.New("election jitter tick must be greater than 0")
 	}
 
 	if c.Storage == nil {
@@ -321,6 +313,10 @@ type raft struct {
 
 	maxMsgSize         entryEncodingSize
 	maxUncommittedSize entryPayloadSize
+	// maxCommittedPageSize limits the size of committed entries that can be
+	// loaded into memory in hasUnappliedConfChanges.
+	// TODO(#131559): avoid this loading in the first place, and remove this.
+	maxCommittedPageSize entryEncodingSize
 
 	config               quorum.Config
 	trk                  tracker.ProgressTracker
@@ -420,18 +416,14 @@ type raft struct {
 	checkQuorum      bool
 	preVote          bool
 
-	heartbeatTimeout int64
-	electionTimeout  int64
+	heartbeatTimeout      int64
+	electionTimeout       int64
+	electionTimeoutJitter int64
 	// randomizedElectionTimeout is a random number between
 	// [electiontimeout, 2 * electiontimeout - 1]. It gets reset
 	// when raft changes its state to follower or candidate.
 	randomizedElectionTimeout int64
 	disableProposalForwarding bool
-
-	// testingDisablePreCampaignStoreLivenessCheck may be used by tests to disable
-	// the check performed by a peer before campaigning to ensure it has
-	// StoreLiveness support from a majority quorum.
-	testingDisablePreCampaignStoreLivenessCheck bool
 
 	tick func()
 	step stepFunc
@@ -440,13 +432,14 @@ type raft struct {
 	storeLiveness raftstoreliveness.StoreLiveness
 	crdbVersion   clusterversion.Handle
 	metrics       *Metrics
+	testingKnobs  *TestingKnobs
 }
 
 func newRaft(c *Config) *raft {
 	if err := c.validate(); err != nil {
 		panic(err.Error())
 	}
-	raftlog := newLogWithSize(c.Storage, c.Logger, entryEncodingSize(c.MaxCommittedSizePerReady))
+	raftlog := newLog(c.Storage, c.Logger)
 	hs, cs, err := c.Storage.InitialState()
 	if err != nil {
 		panic(err) // TODO(bdarnell)
@@ -458,8 +451,10 @@ func newRaft(c *Config) *raft {
 		raftLog:                     raftlog,
 		maxMsgSize:                  entryEncodingSize(c.MaxSizePerMsg),
 		maxUncommittedSize:          entryPayloadSize(c.MaxUncommittedEntriesSize),
+		maxCommittedPageSize:        entryEncodingSize(c.MaxCommittedSizePerReady),
 		lazyReplication:             c.LazyReplication,
 		electionTimeout:             c.ElectionTick,
+		electionTimeoutJitter:       c.ElectionJitterTick,
 		heartbeatTimeout:            c.HeartbeatTick,
 		logger:                      c.Logger,
 		maxInflight:                 c.MaxInflightMsgs,
@@ -468,10 +463,10 @@ func newRaft(c *Config) *raft {
 		preVote:                     c.PreVote,
 		disableProposalForwarding:   c.DisableProposalForwarding,
 		disableConfChangeValidation: c.DisableConfChangeValidation,
-		testingDisablePreCampaignStoreLivenessCheck: c.TestingDisablePreCampaignStoreLivenessCheck,
-		storeLiveness: c.StoreLiveness,
-		crdbVersion:   c.CRDBVersion,
-		metrics:       c.Metrics,
+		storeLiveness:               c.StoreLiveness,
+		crdbVersion:                 c.CRDBVersion,
+		metrics:                     c.Metrics,
+		testingKnobs:                c.TestingKnobs,
 	}
 	lastID := r.raftLog.lastEntryID()
 
@@ -494,7 +489,7 @@ func newRaft(c *Config) *raft {
 		r.loadState(hs)
 	}
 	if c.Applied > 0 {
-		raftlog.appliedTo(c.Applied, 0 /* size */)
+		raftlog.appliedTo(c.Applied)
 	}
 
 	if r.lead == r.id {
@@ -545,13 +540,11 @@ func (r *raft) hardState() pb.HardState {
 // next Ready handling cycle, except in one condition below.
 //
 // Certain message types are scheduled for being sent *after* the unstable state
-// is durably persisted in storage. If AsyncStorageWrites config flag is true,
-// the responsibility of upholding this condition is on the application, so the
-// message will be handed over via the next Ready as usually; if false, the
-// message will skip one Ready handling cycle, and will be sent after the
-// application has persisted the state.
-//
-// TODO(pav-kv): remove this special case after !AsyncStorageWrites is removed.
+// is durably persisted in storage. These messages are nevertheless included in
+// Ready.Messages, and the responsibility of upholding this condition is on the
+// application.
+// TODO(pav-kv): make this requirement explicit in the API, instead of mixing
+// the two kinds of messages together.
 func (r *raft) send(m pb.Message) {
 	if m.From == None {
 		m.From = r.id
@@ -639,6 +632,9 @@ func (r *raft) send(m pb.Message) {
 		// because the safety of such behavior has not been formally verified,
 		// we err on the side of safety and omit a `&& !m.Reject` condition
 		// above.
+		//
+		// TODO(pav-kv): MsgPreVoteResp does not require sync. Consider sending it
+		// immediately.
 		r.msgsAfterAppend = append(r.msgsAfterAppend, m)
 	default:
 		if m.To == r.id {
@@ -651,7 +647,7 @@ func (r *raft) send(m pb.Message) {
 // prepareMsgApp constructs a MsgApp message for being sent to the given peer,
 // and hands it over to the caller. Updates the replication flow control state
 // to account for the fact that the message is about to be sent.
-func (r *raft) prepareMsgApp(to pb.PeerID, pr *tracker.Progress, ls LogSlice) pb.Message {
+func (r *raft) prepareMsgApp(to pb.PeerID, pr *tracker.Progress, ls LeadSlice) pb.Message {
 	commit := r.raftLog.committed
 	// Update the progress accordingly to the message being sent.
 	pr.SentEntries(len(ls.entries), uint64(payloadsSize(ls.entries)))
@@ -675,7 +671,7 @@ func (r *raft) prepareMsgApp(to pb.PeerID, pr *tracker.Progress, ls LogSlice) pb
 //
 // Returns false if the current state of the node does not permit this MsgApp
 // send, e.g. the log slice is misaligned with the replication flow status.
-func (r *raft) maybePrepareMsgApp(to pb.PeerID, ls LogSlice) (pb.Message, bool) {
+func (r *raft) maybePrepareMsgApp(to pb.PeerID, ls LeadSlice) (pb.Message, bool) {
 	if r.state != pb.StateLeader || r.Term != ls.term {
 		return pb.Message{}, false
 	}
@@ -724,10 +720,12 @@ func (r *raft) maybeSendAppend(to pb.PeerID) bool {
 		}
 	}
 
-	r.send(r.prepareMsgApp(to, pr, LogSlice{
-		term:    r.Term,
-		prev:    entryID{index: prevIndex, term: prevTerm},
-		entries: entries,
+	r.send(r.prepareMsgApp(to, pr, LeadSlice{
+		term: r.Term,
+		LogSlice: LogSlice{
+			prev:    entryID{index: prevIndex, term: prevTerm},
+			entries: entries,
+		},
 	}))
 	return true
 }
@@ -748,9 +746,9 @@ func (r *raft) sendPing(to pb.PeerID) bool {
 		return false
 	}
 	// NB: this sets MsgAppProbesPaused to true again.
-	r.send(r.prepareMsgApp(to, pr, LogSlice{
-		term: r.Term,
-		prev: entryID{index: prevIndex, term: prevTerm},
+	r.send(r.prepareMsgApp(to, pr, LeadSlice{
+		term:     r.Term,
+		LogSlice: LogSlice{prev: entryID{index: prevIndex, term: prevTerm}},
 	}))
 	return true
 }
@@ -766,17 +764,16 @@ func (r *raft) maybeSendSnapshot(to pb.PeerID, pr *tracker.Progress) bool {
 	snapshot, err := r.raftLog.snapshot()
 	if err != nil {
 		panic(err) // TODO(pav-kv): handle storage errors uniformly.
-	}
-	if IsEmptySnap(snapshot) {
+	} else if snapshot == nil {
 		panic("need non-empty snapshot")
 	}
 	sindex, sterm := snapshot.Metadata.Index, snapshot.Metadata.Term
 	r.logger.Debugf("%x [firstindex: %d, commit: %d] sent snapshot[index: %d, term: %d] to %x [%s]",
-		r.id, r.raftLog.firstIndex(), r.raftLog.committed, sindex, sterm, to, pr)
+		r.id, r.raftLog.compacted()+1, r.raftLog.committed, sindex, sterm, to, pr)
 	r.becomeSnapshot(pr, sindex)
 	r.logger.Debugf("%x paused sending replication messages to %x [%s]", r.id, to, pr)
 
-	r.send(pb.Message{To: to, Type: pb.MsgSnap, Snapshot: &snapshot})
+	r.send(pb.Message{To: to, Type: pb.MsgSnap, Snapshot: snapshot})
 	return true
 }
 
@@ -977,10 +974,10 @@ func (r *raft) maybeUnpauseAndBcastAppend() {
 	})
 }
 
-func (r *raft) appliedTo(index uint64, size entryEncodingSize) {
+func (r *raft) appliedTo(index uint64) {
 	oldApplied := r.raftLog.applied
 	newApplied := max(index, oldApplied)
-	r.raftLog.appliedTo(newApplied, size)
+	r.raftLog.appliedTo(newApplied)
 
 	if r.config.AutoLeave && newApplied >= r.pendingConfIndex && r.state == pb.StateLeader {
 		// If the current (and most recent, at least for this leader's term)
@@ -1006,10 +1003,9 @@ func (r *raft) appliedTo(index uint64, size entryEncodingSize) {
 	}
 }
 
-func (r *raft) appliedSnap(snap *pb.Snapshot) {
-	index := snap.Metadata.Index
+func (r *raft) appliedSnap(index uint64) {
 	r.raftLog.stableSnapTo(index)
-	r.appliedTo(index, 0 /* size */)
+	r.appliedTo(index)
 }
 
 // maybeCommit attempts to advance the commit index. Returns true if the commit
@@ -1028,9 +1024,16 @@ func (r *raft) maybeCommit() bool {
 	// replicas; once an entry from the current term has been committed in this
 	// way, then all prior entries are committed indirectly because of the Log
 	// Matching Property.
-	if !r.raftLog.matchTerm(entryID{term: r.Term, index: index}) {
+	//
+	// This comparison is equivalent in output to:
+	// if !r.raftLog.matchTerm(entryID{term: r.Term, index: index})
+	// But avoids (potentially) loading the entry term from storage.
+	// termCache.last() stores the first entryID added to raftLog in the
+	// current leader term by invariants.
+	if index < r.raftLog.termCache.last().index {
 		return false
 	}
+
 	r.raftLog.commitTo(LogMark{Term: r.Term, Index: index})
 	return true
 }
@@ -1067,9 +1070,6 @@ func (r *raft) reset(term uint64) {
 			Next:        r.raftLog.lastIndex() + 1,
 			Inflights:   tracker.NewInflights(r.maxInflight, r.maxInflightBytes),
 			IsLearner:   pr.IsLearner,
-		}
-		if id == r.id {
-			pr.Match = r.raftLog.lastIndex()
 		}
 	})
 
@@ -1136,7 +1136,7 @@ func (r *raft) appendEntry(es ...pb.Entry) (accepted bool) {
 		// Drop the proposal.
 		return false
 	}
-	app := LogSlice{term: r.Term, prev: last, entries: es}
+	app := LeadSlice{term: r.Term, LogSlice: LogSlice{prev: last, entries: es}}
 	if err := app.valid(); err != nil {
 		r.logger.Panicf("%x leader could not append to its log: %v", r.id, err)
 	} else if !r.raftLog.append(app) {
@@ -1194,6 +1194,12 @@ func (r *raft) tickElection() {
 	}
 
 	if r.atRandomizedElectionTimeout() {
+		// At this point we know that we want to campaign, and we don't support a
+		// leader. We should be able to safely forget the leader as we've already
+		// verified that campaigning won't violate any fortification promises.
+		// Resetting the leader is important to allow upper layers to correctly
+		// detect ranges that don't have raft availability.
+		r.resetLead()
 		if err := r.Step(pb.Message{From: r.id, Type: pb.MsgHup}); err != nil {
 			r.logger.Debugf("error occurred during election: %v", err)
 		}
@@ -1421,7 +1427,8 @@ func (r *raft) hup(t CampaignType) {
 	// only make an exception if this is a leadership transfer, because otherwise
 	// the transfer might fail if the new leader doesn't already have support.
 	if t != campaignTransfer && r.fortificationTracker.RequireQuorumSupportOnCampaign() &&
-		!r.fortificationTracker.QuorumSupported() && !r.testingDisablePreCampaignStoreLivenessCheck {
+		!r.fortificationTracker.QuorumSupported() &&
+		!r.testingKnobs.IsPreCampaignStoreLivenessCheckDisabled() {
 		r.logger.Debugf("%x cannot campaign since it's not supported by a quorum in store liveness", r.id)
 		return
 	}
@@ -1460,13 +1467,7 @@ func (r *raft) hasUnappliedConfChanges() bool {
 	// Scan all unapplied committed entries to find a config change. Paginate the
 	// scan, to avoid a potentially unlimited memory spike.
 	lo, hi := r.raftLog.applied, r.raftLog.committed
-	// Reuse the maxApplyingEntsSize limit because it is used for similar purposes
-	// (limiting the read of unapplied committed entries) when raft sends entries
-	// via the Ready struct for application.
-	// TODO(pavelkalinnikov): find a way to budget memory/bandwidth for this scan
-	// outside the raft package.
-	pageSize := r.raftLog.maxApplyingEntsSize
-	if err := r.raftLog.scan(lo, hi, pageSize, func(ents []pb.Entry) error {
+	if err := r.raftLog.scan(lo, hi, r.maxCommittedPageSize, func(ents []pb.Entry) error {
 		for i := range ents {
 			if ents[i].Type == pb.EntryConfChange || ents[i].Type == pb.EntryConfChangeV2 {
 				found = true
@@ -1700,23 +1701,6 @@ func (r *raft) Step(m pb.Message) error {
 			r.hup(campaignPreElection)
 		} else {
 			r.hup(campaignElection)
-		}
-
-	case pb.MsgStorageAppendResp:
-		// The snapshot precedes the entries. We acknowledge the snapshot first,
-		// then the entries, as required by the unstable structure.
-		if m.Snapshot != nil {
-			r.appliedSnap(m.Snapshot)
-		}
-		if m.Index != 0 {
-			r.raftLog.stableTo(LogMark{Term: m.LogTerm, Index: m.Index})
-		}
-
-	case pb.MsgStorageApplyResp:
-		if len(m.Entries) > 0 {
-			index := m.Entries[len(m.Entries)-1].Index
-			r.appliedTo(index, entsSize(m.Entries))
-			r.reduceUncommittedSize(payloadsSize(m.Entries))
 		}
 
 	case pb.MsgVote, pb.MsgPreVote:
@@ -2055,7 +2039,7 @@ func stepLeader(r *raft, m pb.Message) error {
 				switch {
 				case pr.State == tracker.StateProbe:
 					r.becomeReplicate(pr)
-				case pr.State == tracker.StateSnapshot && pr.Match+1 >= r.raftLog.firstIndex():
+				case pr.State == tracker.StateSnapshot && pr.Match >= r.raftLog.compacted():
 					// Note that we don't take into account PendingSnapshot to
 					// enter this branch. No matter at which index a snapshot
 					// was actually applied, as long as this allows catching up
@@ -2094,15 +2078,8 @@ func stepLeader(r *raft, m pb.Message) error {
 		}
 
 	case pb.MsgFortifyLeaderResp:
+		pr.RecentActive = true
 		r.handleFortifyResp(m)
-		// We do the same as we do when receiving a MsgHeartbeatResp.
-		// NB: We ignore self-addressed messages as we don't send MsgApp to
-		// ourselves.
-		if m.From != r.id {
-			pr.RecentActive = true
-			pr.MsgAppProbesPaused = false
-			r.maybeSendAppend(m.From)
-		}
 
 	case pb.MsgHeartbeatResp:
 		pr.RecentActive = true
@@ -2233,11 +2210,11 @@ func stepCandidate(r *raft, m pb.Message) error {
 
 func stepFollower(r *raft, m pb.Message) error {
 	if IsMsgFromLeader(m.Type) {
-		r.setLead(m.From)
 		if m.Type != pb.MsgDeFortifyLeader {
 			// If we receive any message from the leader except a MsgDeFortifyLeader,
 			// we know that the leader is still alive and still acting as the leader,
 			// so reset the election timer.
+			r.setLead(m.From)
 			r.electionElapsed = 0
 		}
 	}
@@ -2296,10 +2273,10 @@ func stepFollower(r *raft, m pb.Message) error {
 		// may never be safe for MsgTimeoutNow to come from anyone but the leader.
 		// We need to think about this more.
 		//
-		//if r.supportingFortifiedLeader() && r.lead != m.From {
+		// if r.supportingFortifiedLeader() && r.lead != m.From {
 		//	r.logger.Infof("%x [term %d] ignored MsgTimeoutNow from %x due to leader fortification", r.id, r.Term, m.From)
 		//	return nil
-		//}
+		// }
 		r.logger.Infof("%x [term %d] received MsgTimeoutNow from %x and starts an election to get leadership", r.id, r.Term, m.From)
 		// Leadership transfers never use pre-vote even if r.preVote is true; we
 		// know we are not recovering from a partition so there is no need for the
@@ -2331,7 +2308,7 @@ func (r *raft) checkQuorumActive() {
 		r.logger.Debugf("%x does not have store liveness support from a quorum of peers", r.id)
 	}
 	if !quorumActiveByHeartbeats && !quorumActiveByFortification {
-		r.logger.Warningf("%x stepped down to follower since quorum is not active", r.id)
+		r.logger.Infof("%x stepped down to follower since quorum is not active", r.id)
 		r.becomeFollower(r.Term, None)
 	}
 	// Mark everyone (but ourselves) as inactive in preparation for the next
@@ -2343,22 +2320,24 @@ func (r *raft) checkQuorumActive() {
 	})
 }
 
-// logSliceFromMsgApp extracts the appended LogSlice from a MsgApp message.
-func logSliceFromMsgApp(m *pb.Message) LogSlice {
-	// TODO(pav-kv): consider also validating the LogSlice here.
-	return LogSlice{
-		term:    m.Term,
-		prev:    entryID{term: m.LogTerm, index: m.Index},
-		entries: m.Entries,
+// leadSliceFromMsgApp extracts the appended LeadSlice from a MsgApp message.
+func leadSliceFromMsgApp(m *pb.Message) LeadSlice {
+	// TODO(pav-kv): consider also validating the LeadSlice here.
+	return LeadSlice{
+		term: m.Term,
+		LogSlice: LogSlice{
+			prev:    entryID{term: m.LogTerm, index: m.Index},
+			entries: m.Entries,
+		},
 	}
 }
 
 func (r *raft) handleAppendEntries(m pb.Message) {
 	r.checkMatch(m.Match)
 
-	// TODO(pav-kv): construct LogSlice up the stack next to receiving the
+	// TODO(pav-kv): construct LeadSlice up the stack next to receiving the
 	// message, and validate it before taking any action (e.g. bumping term).
-	a := logSliceFromMsgApp(&m)
+	a := leadSliceFromMsgApp(&m)
 	if err := a.valid(); err != nil {
 		// TODO(pav-kv): add a special kind of logger.Errorf that panics in tests,
 		// but logs an error in prod. We want to eliminate all such errors in tests.
@@ -2366,11 +2345,26 @@ func (r *raft) handleAppendEntries(m pb.Message) {
 		return
 	}
 
-	if a.prev.index < r.raftLog.committed {
-		r.send(pb.Message{To: m.From, Type: pb.MsgAppResp, Index: r.raftLog.committed,
-			Commit: r.raftLog.committed})
+	// If the appended batch has no entries above the committed index, there is no
+	// new information in it. Instruct the leader to at least send a batch above
+	// the committed index.
+	if commit := r.raftLog.committed; a.lastIndex() <= commit {
+		// NB: A prerequisite for sending MsgAppResp, which is met here, is that the
+		// entry at Index is durable and matches the leader's. The durability is
+		// guaranteed due to the way r.send is handled. There is also a guarantee
+		// that all the leaders at term >= r.Term have the same committed prefix.
+		r.send(pb.Message{To: m.From, Type: pb.MsgAppResp, Index: commit, Commit: commit})
 		return
+	} else if a.prev.index < commit {
+		// Discard the already committed entries from the appended log slice. They
+		// might have been already compacted out, so we don't try to match against
+		// them, but we could as a matter of an assertion. The maybeAppend call
+		// below still makes sure that the new "prev" entry ID in the appended log
+		// slice matches our log, so, by the Log Matching Property, all the
+		// preceding entries must have matched too.
+		a.LogSlice = a.forward(commit)
 	}
+
 	if r.raftLog.maybeAppend(a) {
 		// TODO(pav-kv): make it possible to commit even if the append did not
 		// succeed or is stale. If accTerm >= m.Term, then our log contains all
@@ -2453,8 +2447,40 @@ func (r *raft) handleSnapshot(m pb.Message) {
 	if r.restore(s) {
 		r.logger.Infof("%x [commit: %d] restored snapshot [index: %d, term: %d]",
 			r.id, r.raftLog.committed, id.index, id.term)
+
+		// To send MsgAppResp to any leader, we must be sure that our log is
+		// consistent with that leader's log.
+		//
+		// After restore(s), our log ends at the entryID of this snapshot.
+		// The snapshot came from a node at m.Term (typically the leader).
+		// Everything in this snapshot has been committed during m.Term or earlier,
+		// and will be present in all future term logs. It is thus safe to send
+		// MsgAppResp to any leader at term >= m.Term.
+		//
+		// From section 5.4 of the Raft paper:
+		// if a log entry is committed in a given term, then that entry will be
+		// present in the logs of the leaders for all higher-numbered terms.
 		r.send(pb.Message{To: m.From, Type: pb.MsgAppResp, Index: r.raftLog.lastIndex(),
 			Commit: r.raftLog.committed})
+
+		// A leadership change may have happened while the snapshot was in flight.
+		// Therefore we need to send the MsgAppResp to the new leader as well.
+		//
+		// If we don't send response to the new leader, the new leader will not
+		// know that we have committed up to the snapshot index. This will cause
+		// delay for the new leader to transfer this follower to stateReplicate.
+		// (Since the new leader may send its own snapshot to this follower and
+		// wait for the MsgAppResp of that snapshot).
+		// Which may ultimately cause unwanted commit delay for client.
+		//
+		// Sending this response to the new leader allows the new leader to know
+		// this follower is caught up ASAP.
+		//
+		// TODO(pav-kv): consider if we can only send to r.lead.
+		if r.lead != None && r.lead != m.From {
+			r.send(pb.Message{To: r.lead, Type: pb.MsgAppResp, Index: r.raftLog.lastIndex(),
+				Commit: r.raftLog.committed})
+		}
 	} else {
 		r.logger.Infof("%x [commit: %d] ignored snapshot [index: %d, term: %d]",
 			r.id, r.raftLog.committed, id.index, id.term)
@@ -2803,7 +2829,7 @@ func (r *raft) atRandomizedElectionTimeout() bool {
 }
 
 func (r *raft) resetRandomizedElectionTimeout() {
-	r.randomizedElectionTimeout = r.electionTimeout + globalRand.Int63n(r.electionTimeout)
+	r.randomizedElectionTimeout = r.electionTimeout + globalRand.Int63n(r.electionTimeoutJitter)
 }
 
 func (r *raft) transferLeader(to pb.PeerID) {

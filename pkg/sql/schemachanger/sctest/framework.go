@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -628,6 +629,9 @@ type CumulativeTestCaseSpec struct {
 	// DatabaseName contains the name of the database on which the schema change
 	// is applied.
 	DatabaseName string
+
+	// CreateDatabaseStmt contains the CREATE DATABASE statement for the database.
+	CreateDatabaseStmt string
 }
 
 func (cs CumulativeTestCaseSpec) run(t *testing.T, fn func(t *testing.T)) bool {
@@ -659,6 +663,7 @@ func cumulativeTestForEachPostCommitStage(
 		var postCommitCount, postCommitNonRevertibleCount int
 		var after [][]string
 		var dbName string
+		var createDatabaseStmt string
 		prepfn := func(db *gosql.DB, p scplan.Plan) {
 			for _, s := range p.Stages {
 				switch s.Phase {
@@ -673,6 +678,8 @@ func cumulativeTestForEachPostCommitStage(
 			dbName, ok = maybeGetDatabaseForIDs(t, tdb, screl.AllTargetStateDescIDs(p.TargetState))
 			if ok {
 				tdb.Exec(t, fmt.Sprintf("USE %q", dbName))
+				res := tdb.QueryStr(t, fmt.Sprintf("SELECT create_statement FROM [SHOW CREATE DATABASE %q]", dbName))
+				createDatabaseStmt = res[0][0]
 			}
 			after = tdb.QueryStr(t, fetchDescriptorStateQuery)
 		}
@@ -694,6 +701,7 @@ func cumulativeTestForEachPostCommitStage(
 				StagesCount:        postCommitCount,
 				After:              after,
 				DatabaseName:       dbName,
+				CreateDatabaseStmt: createDatabaseStmt,
 			})
 		}
 		for stageOrdinal := 1; stageOrdinal <= postCommitNonRevertibleCount; stageOrdinal++ {
@@ -704,6 +712,7 @@ func cumulativeTestForEachPostCommitStage(
 				StagesCount:        postCommitNonRevertibleCount,
 				After:              after,
 				DatabaseName:       dbName,
+				CreateDatabaseStmt: createDatabaseStmt,
 			})
 		}
 		var hasFailed bool
@@ -809,8 +818,13 @@ func withPostCommitPlanAfterSchemaChange(
 	ctx := context.Background()
 	var processOnce sync.Once
 	var postCommitPlan scplan.Plan
+	var knobEnabled atomic.Bool
 	factory.WithSchemaChangerKnobs(&scexec.TestingKnobs{
 		BeforeStage: func(p scplan.Plan, _ int) error {
+			// Only enabled after setup.
+			if !knobEnabled.Load() {
+				return nil
+			}
 			if p.Params.ExecutionPhase >= scop.PostCommitPhase {
 				processOnce.Do(func() { postCommitPlan = p })
 			}
@@ -818,6 +832,7 @@ func withPostCommitPlanAfterSchemaChange(
 		},
 	}).Run(context.Background(), t, func(_ serverutils.TestServerInterface, db *gosql.DB) {
 		require.NoError(t, setupSchemaChange(ctx, t, spec, db))
+		knobEnabled.Swap(true)
 		require.NoError(t, executeSchemaChangeTxn(ctx, t, spec, db))
 		waitForSchemaChangesToFinish(t, sqlutils.MakeSQLRunner(db))
 		fn(db, postCommitPlan)
@@ -832,9 +847,8 @@ func setupSchemaChange(
 
 	tdb := sqlutils.MakeSQLRunner(db)
 
-	// Execute the setup statements with the legacy schema changer so that the
-	// declarative schema changer testing knobs don't get used.
-	tdb.Exec(t, "SET use_declarative_schema_changer = 'off'")
+	// Execute the setup statements with the declarative schema changer, we will
+	// disable the knobs before this.
 	for i, stmt := range spec.Setup {
 		if _, err := tdb.DB.ExecContext(ctx, stmt.SQL); err != nil {
 			// nolint:errcmp
@@ -872,14 +886,15 @@ func executeSchemaChangeTxn(
 			_, err = conn.ExecContext(
 				ctx, "SET experimental_enable_temp_tables=true",
 			)
-			_, err = conn.ExecContext(
-				ctx, "SET enable_row_level_security=true",
-			)
 			if err != nil {
 				return err
 			}
 			var tx *gosql.Tx
 			tx, err = conn.BeginTx(ctx, nil)
+			if err != nil {
+				return err
+			}
+			_, err = tx.ExecContext(ctx, "SET LOCAL autocommit_before_ddl = false")
 			if err != nil {
 				return err
 			}

@@ -40,6 +40,7 @@ go_library(
         "helpers.go",
         "index_zone_config.go",
         "named_range_zone_config.go",
+        "partition_helpers.go",
         "partition_zone_config.go",
         "process.go",
         "statement_control.go",
@@ -83,6 +84,7 @@ go_library(
         "//pkg/sql/pgwire/pgerror",
         "//pkg/sql/pgwire/pgnotice",
         "//pkg/sql/privilege",
+        "//pkg/sql/regions",
         "//pkg/sql/rowenc",
         "//pkg/sql/rowenc/valueside",
         "//pkg/sql/schemachange",
@@ -106,8 +108,8 @@ go_library(
         "//pkg/sql/storageparam",
         "//pkg/sql/storageparam/indexstorageparam",
         "//pkg/sql/types",
+        "//pkg/sql/vecindex",
         "//pkg/util/encoding",
-        "//pkg/util/envutil",
         "//pkg/util/errorutil/unimplemented",
         "//pkg/util/log/eventpb",
         "//pkg/util/log/logpb",
@@ -115,6 +117,7 @@ go_library(
         "@com_github_cockroachdb_errors//:errors",
         "@com_github_cockroachdb_redact//:redact",
         "@com_github_lib_pq//oid",
+        "@org_golang_google_protobuf//proto",
     ],
 )
 

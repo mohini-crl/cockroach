@@ -68,7 +68,9 @@ type batchedPlanNode interface {
 }
 
 var _ batchedPlanNode = &deleteNode{}
+var _ batchedPlanNode = &deleteSwapNode{}
 var _ batchedPlanNode = &updateNode{}
+var _ batchedPlanNode = &updateSwapNode{}
 
 // serializeNode serializes the results of a batchedPlanNode into a
 // plain planNode interface. In other words, it wraps around
@@ -132,6 +134,11 @@ func (s *serializeNode) Input(i int) (planNode, error) {
 		return s.source, nil
 	}
 	return nil, errors.AssertionFailedf("input index %d is out of range", i)
+}
+
+func (r *serializeNode) SetInput(i int, p planNode) error {
+	// The source cannot be set.
+	return nil
 }
 
 // FastPathResults implements the planNodeFastPath interface.
@@ -199,6 +206,11 @@ func (r *rowCountNode) Input(i int) (planNode, error) {
 		return r.source, nil
 	}
 	return nil, errors.AssertionFailedf("input index %d is out of range", i)
+}
+
+func (r *rowCountNode) SetInput(i int, p planNode) error {
+	// The source cannot be set.
+	return nil
 }
 
 // FastPathResults implements the planNodeFastPath interface.

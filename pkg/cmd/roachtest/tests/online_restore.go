@@ -17,6 +17,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/clusterstats"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/spec"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
@@ -143,7 +144,7 @@ func registerOnlineRestorePerf(r registry.Registry) {
 						Name:      sp.testName,
 						Owner:     registry.OwnerDisasterRecovery,
 						Benchmark: true,
-						Cluster:   sp.hardware.makeClusterSpecs(r, sp.backup.cloud),
+						Cluster:   sp.hardware.makeClusterSpecs(r),
 						Timeout:   sp.timeout,
 						// These tests measure performance. To ensure consistent perf,
 						// disable metamorphic encryption.
@@ -224,7 +225,7 @@ func registerOnlineRestoreCorrectness(r registry.Registry) {
 		registry.TestSpec{
 			Name:                      sp.testName,
 			Owner:                     registry.OwnerDisasterRecovery,
-			Cluster:                   sp.hardware.makeClusterSpecs(r, sp.backup.cloud),
+			Cluster:                   sp.hardware.makeClusterSpecs(r),
 			Timeout:                   sp.timeout,
 			CompatibleClouds:          sp.backup.CompatibleClouds(),
 			Suites:                    sp.suites,
@@ -366,13 +367,13 @@ func exportStats(ctx context.Context, rd restoreDriver, restoreStats restoreStat
 		restoreStats.workloadStartTime,
 		endTime,
 		[]clusterstats.AggQuery{sqlServiceLatencyP95Agg, queriesThroughputAgg},
-		func(stats map[string]clusterstats.StatSummary) (string, float64) {
+		func(stats map[string]clusterstats.StatSummary) *roachtestutil.AggregatedMetric {
 			var timeToHealth time.Time
 			healthyLatencyRatio := 1.25
 			n := len(stats[latencyQueryKey].Value)
 			rd.t.L().Printf("aggregating latency over %d data points", n)
 			if n == 0 {
-				return "", 0
+				return nil // Return nil for no data points
 			}
 			healthyLatency := stats[latencyQueryKey].Value[n-1]
 			latestHealthyValue := healthyLatency
@@ -394,7 +395,14 @@ func exportStats(ctx context.Context, rd restoreDriver, restoreStats restoreStat
 			description := "Time to within 1.25x of regular p95 latency (mins)"
 			rd.t.L().Printf("%s: %.2f minutes, compared to link + download phase time %.2f", description, rto, fullRestoreTime)
 			rd.t.L().Printf("Latency at Recovery Time %.0f ms; at end of test %.0f ms", latestHealthyValue, healthyLatency)
-			return description, rto
+
+			return &roachtestutil.AggregatedMetric{
+				Name:             description,
+				Value:            roachtestutil.MetricPoint(rto),
+				Unit:             "minutes",
+				IsHigherBetter:   false,
+				AdditionalLabels: nil,
+			}
 		},
 	)
 	if err != nil {
@@ -457,7 +465,7 @@ func waitForDownloadJob(
 			if err := conn.QueryRow(`SELECT status FROM [SHOW JOBS] WHERE job_type = 'RESTORE' ORDER BY created DESC LIMIT 1`).Scan(&status); err != nil {
 				return downloadJobEndTimeLowerBound, err
 			}
-			if status == string(jobs.StatusSucceeded) {
+			if status == string(jobs.StateSucceeded) {
 				var externalBytes uint64
 				if err := conn.QueryRow(jobutils.GetExternalBytesForConnectedTenant).Scan(&externalBytes); err != nil {
 					return downloadJobEndTimeLowerBound, errors.Wrapf(err, "could not get external bytes")
@@ -470,7 +478,7 @@ func waitForDownloadJob(
 				time.Sleep(postDownloadDelay)
 				downloadJobEndTimeLowerBound = timeutil.Now().Add(-pollingInterval).Add(-postDownloadDelay)
 				return downloadJobEndTimeLowerBound, nil
-			} else if status == string(jobs.StatusRunning) {
+			} else if status == string(jobs.StateRunning) {
 				l.Printf("Download job still running")
 			} else {
 				return downloadJobEndTimeLowerBound, errors.Newf("job unexpectedly found in %s state", status)

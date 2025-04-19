@@ -41,6 +41,18 @@ var configJson []byte
 //go:embed old.json
 var oldJson []byte
 
+var (
+	// TODO(golgeek, 2025-03-25): remove this in one year or so when all
+	// resources are created with the unified tags.
+	legacyTagsRemapping = map[string]string{
+		"Cluster":   vm.TagCluster,
+		"Created":   vm.TagCreated,
+		"Lifetime":  vm.TagLifetime,
+		"Roachprod": vm.TagRoachprod,
+		"Spot":      vm.TagSpotInstance,
+	}
+)
+
 // Init initializes the AWS provider and registers it into vm.Providers.
 //
 // If the aws tool is not available on the local path, the provider is a stub.
@@ -351,6 +363,12 @@ func (p *Provider) GetHostErrorVMs(
 	return nil, nil
 }
 
+func (p *Provider) GetLiveMigrationVMs(
+	l *logger.Logger, vms vm.List, since time.Time,
+) ([]string, error) {
+	return nil, nil
+}
+
 // GetVMSpecs returns a map from VM.Name to a map of VM attributes, provided by AWS
 func (p *Provider) GetVMSpecs(
 	l *logger.Logger, vms vm.List,
@@ -446,7 +464,17 @@ type Tags []Tag
 func (t Tags) MakeMap() map[string]string {
 	tagMap := make(map[string]string, len(t))
 	for _, entry := range t {
-		tagMap[entry.Key] = entry.Value
+
+		// If the resource was created with the legacy tags, we remap
+		// to the unified ones.
+		// TODO(golgeek, 2025-03-25): remove this in one year or so when all
+		// resources are created with the unified tags.
+		if tag, ok := legacyTagsRemapping[entry.Key]; ok {
+			tagMap[tag] = entry.Value
+		} else {
+			tagMap[entry.Key] = entry.Value
+		}
+
 	}
 	return tagMap
 }
@@ -831,7 +859,7 @@ func (p *Provider) Reset(l *logger.Logger, vms vm.List) error {
 // This will update the Lifetime tag on the instances.
 func (p *Provider) Extend(l *logger.Logger, vms vm.List, lifetime time.Duration) error {
 	return p.AddLabels(l, vms, map[string]string{
-		"Lifetime": lifetime.String(),
+		vm.TagLifetime: lifetime.String(),
 	})
 }
 
@@ -1080,6 +1108,13 @@ type DescribeInstancesOutputInstance struct {
 	InstanceType          string
 	InstanceLifecycle     string `json:"InstanceLifecycle"`
 	SpotInstanceRequestId string `json:"SpotInstanceRequestId"`
+
+	// Encodes IAM identifier for this instance.
+	IamInstanceProfile struct {
+		// Of the form "Arn": "arn:aws:iam::[0-9]+:instance-profile/roachprod-testing"
+		Arn string `json:"Arn"`
+		Id  string `json:"Id"`
+	}
 }
 
 // toVM converts an ec2 instance to a vm.VM struct.
@@ -1097,7 +1132,7 @@ func (in *DescribeInstancesOutputInstance) toVM(
 	}
 
 	var lifetime time.Duration
-	if lifeText, ok := tagMap["Lifetime"]; ok {
+	if lifeText, ok := tagMap[vm.TagLifetime]; ok {
 		lifetime, err = time.ParseDuration(lifeText)
 		if err != nil {
 			errs = append(errs, err)
@@ -1123,6 +1158,12 @@ func (in *DescribeInstancesOutputInstance) toVM(
 			}
 		}
 	}
+	// Parse IamInstanceProfile.Arn to extract IAM identifier.
+	// The ARN is of the form "arn:aws:iam::[0-9]+:instance-profile/roachprod-testing"
+	iamIdentifier := ""
+	if in.IamInstanceProfile.Arn != "" {
+		iamIdentifier = strings.Split(strings.TrimPrefix(in.IamInstanceProfile.Arn, "arn:aws:iam::"), ":")[0]
+	}
 
 	return &vm.VM{
 		CreatedAt:              createdAt,
@@ -1134,6 +1175,7 @@ func (in *DescribeInstancesOutputInstance) toVM(
 		PrivateIP:              in.PrivateIPAddress,
 		Provider:               ProviderName,
 		ProviderID:             in.InstanceID,
+		ProviderAccountID:      iamIdentifier,
 		PublicIP:               in.PublicIPAddress,
 		RemoteUser:             remoteUserName,
 		VPC:                    in.VpcID,
@@ -1143,7 +1185,6 @@ func (in *DescribeInstancesOutputInstance) toVM(
 		NonBootAttachedVolumes: nonBootableVolumes,
 		Preemptible:            in.InstanceLifecycle == "spot",
 	}
-
 }
 
 // CancelSpotInstanceRequestsOutput represents the output structure of the cancel-spot-instance-requests command.
@@ -1207,7 +1248,7 @@ func (p *Provider) describeInstances(
 			tagMap := in.Tags.MakeMap()
 
 			// Ignore any instances that we didn't create
-			if tagMap["Roachprod"] != "true" {
+			if tagMap[vm.TagRoachprod] != "true" {
 				continue in
 			}
 
@@ -1264,16 +1305,14 @@ func (p *Provider) runInstance(
 	m[vm.TagCreated] = timeutil.Now().Format(time.RFC3339)
 	m["Name"] = name
 
+	// TODO(golgeek, 2025-03-25): In an effort to unify tags in lowercase across
+	// all providers, AWS cost analysis dashboard will break as they look for a
+	// capitalized `Cluster` tag. We duplicate the tag for now and will remove it
+	// once all resources are created with the unified tags in a year or so.
+	m["Cluster"] = m[vm.TagCluster]
+
 	if providerOpts.UseSpot {
 		m[vm.TagSpotInstance] = "true"
-	}
-
-	var awsLabelsNameMap = map[string]string{
-		vm.TagCluster:      "Cluster",
-		vm.TagCreated:      "Created",
-		vm.TagLifetime:     "Lifetime",
-		vm.TagRoachprod:    "Roachprod",
-		vm.TagSpotInstance: "Spot",
 	}
 
 	var labelPairs []string
@@ -1292,9 +1331,6 @@ func (p *Provider) runInstance(
 		addLabel(key, value)
 	}
 	for key, value := range m {
-		if n, ok := awsLabelsNameMap[key]; ok {
-			key = n
-		}
 		addLabel(key, value)
 	}
 	labels := strings.Join(labelPairs, ",")
@@ -1309,7 +1345,14 @@ func (p *Provider) runInstance(
 			extraMountOpts = "nobarrier"
 		}
 	}
-	filename, err := writeStartupScript(name, extraMountOpts, opts.SSDOpts.FileSystem, providerOpts.UseMultipleDisks, opts.Arch == string(vm.ArchFIPS))
+	filename, err := writeStartupScript(
+		name,
+		extraMountOpts,
+		opts.SSDOpts.FileSystem,
+		providerOpts.UseMultipleDisks,
+		opts.Arch == string(vm.ArchFIPS),
+		providerOpts.RemoteUserName,
+	)
 	if err != nil {
 		return nil, errors.Wrapf(err, "could not write AWS startup script to temp file")
 	}

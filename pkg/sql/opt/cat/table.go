@@ -46,6 +46,9 @@ type Table interface {
 	// that they cannot be mutated.
 	IsMaterializedView() bool
 
+	// LookupColumnOrdinal returns the ordinal of the column with the given ID.
+	LookupColumnOrdinal(colID descpb.ColumnID) (int, error)
+
 	// ColumnCount returns the number of columns in the table. This includes
 	// public columns, write-only columns, etc.
 	ColumnCount() int
@@ -116,7 +119,7 @@ type Table interface {
 	// references (where this is the origin table).
 	OutboundForeignKeyCount() int
 
-	// OutboundForeignKeyCount returns the ith outbound foreign key reference.
+	// OutboundForeignKey returns the ith outbound foreign key reference.
 	OutboundForeignKey(i int) ForeignKeyConstraint
 
 	// InboundForeignKeyCount returns the number of inbound foreign key references
@@ -172,6 +175,10 @@ type Table interface {
 	// owning database could not be determined.
 	GetDatabaseID() descpb.ID
 
+	// GetSchemaID returns the owning schema id of the table, or zero, if the
+	// owning schema could not be determined.
+	GetSchemaID() descpb.ID
+
 	// IsHypothetical returns true if this is a hypothetical table (used when
 	// searching for index recommendations).
 	IsHypothetical() bool
@@ -185,12 +192,12 @@ type Table interface {
 	// IsRowLevelSecurityEnabled is true if policies should be applied during the query.
 	IsRowLevelSecurityEnabled() bool
 
-	// PolicyCount returns the number of policies in the table for the given type.
-	PolicyCount(polType tree.PolicyType) int
+	// IsRowLevelSecurityForced is true if row-level security policies should be
+	// applied to the table owner.
+	IsRowLevelSecurityForced() bool
 
-	// Policy retrieves the policy of the specified type at the given index (i),
-	// where i < PolicyCount for the specified type.
-	Policy(polType tree.PolicyType, i int) Policy
+	// Policies returns all the policies defined for this table.
+	Policies() *Policies
 }
 
 // CheckConstraint represents a check constraint on a table. Check constraints
@@ -212,6 +219,10 @@ type CheckConstraint interface {
 	// ColumnOrdinal returns the table column ordinal of the ith column in this
 	// constraint.
 	ColumnOrdinal(i int) int
+
+	// IsRLSConstraint is true if this is a constraint used to enforce
+	// row-level security policies.
+	IsRLSConstraint() bool
 }
 
 // TableStatistic is an interface to a table statistic. Each statistic is

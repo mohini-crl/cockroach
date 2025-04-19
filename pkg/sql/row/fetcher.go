@@ -43,10 +43,6 @@ import (
 	"github.com/lib/pq/oid"
 )
 
-// DebugRowFetch can be used to turn on some low-level debugging logs. We use
-// this to avoid using log.V in the hot path.
-const DebugRowFetch = false
-
 // noOutputColumn is a sentinel value to denote that a system column is not
 // part of the output.
 const noOutputColumn = -1
@@ -363,7 +359,7 @@ func (rf *Fetcher) Init(ctx context.Context, args FetcherInitArgs) error {
 
 	if args.MemMonitor != nil {
 		rf.mon = mon.NewMonitorInheritWithLimit(
-			"fetcher-mem", 0 /* limit */, args.MemMonitor, false, /* longLiving */
+			mon.MakeName("fetcher-mem"), 0 /* limit */, args.MemMonitor, false, /* longLiving */
 		)
 		rf.mon.StartNoReserved(ctx, args.MemMonitor)
 		memAcc := rf.mon.MakeBoundAccount()
@@ -641,14 +637,28 @@ func (rf *Fetcher) StartInconsistentScan(
 		return errors.AssertionFailedf("no spans")
 	}
 
-	txnTimestamp := initialTimestamp
 	txnStartTime := timeutil.Now()
-	if txnStartTime.Sub(txnTimestamp.GoTime()) >= maxTimestampAge {
-		return errors.Errorf(
-			"AS OF SYSTEM TIME: cannot specify timestamp older than %s for this operation",
-			maxTimestampAge,
-		)
+	if txnStartTime.Sub(initialTimestamp.GoTime()) >= maxTimestampAge {
+		// The initial timestamp is too far into the past already (which can
+		// happen when the cluster is overloaded, or there was a delay in the
+		// stats job being picked up for execution, or some other reason). In
+		// such case we'll advance the timestamp so that its age is about 1/10
+		// of the maximum age.
+		targetTimestampAge := maxTimestampAge.Nanoseconds() / 10
+		if targetTimestampAge < int64(100*time.Millisecond) {
+			// Ensure at least 100ms timestamp age. We shouldn't reach this line
+			// unless the max timestamp age setting is set way too low (or
+			// negative, by mistake), so we're just being conservative.
+			targetTimestampAge = int64(100 * time.Millisecond)
+		}
+		advanceBy := txnStartTime.Sub(initialTimestamp.GoTime()).Nanoseconds() - targetTimestampAge
+		if log.V(1) {
+			log.Infof(ctx, "initial timestamp %v too far into the past, advancing it by %v", initialTimestamp, advanceBy)
+		}
+		initialTimestamp = initialTimestamp.Add(advanceBy, 0 /* logical */)
 	}
+
+	txnTimestamp := initialTimestamp
 	txn := kv.NewTxnWithSteppingEnabled(ctx, db, 0 /* gatewayNodeID */, qualityOfService)
 	if err := txn.SetFixedTimestamp(ctx, txnTimestamp); err != nil {
 		return err
@@ -695,7 +705,7 @@ func (rf *Fetcher) StartInconsistentScan(
 	}
 
 	if err := rf.kvFetcher.SetupNextFetch(
-		ctx, spans, nil, batchBytesLimit,
+		ctx, spans, nil /* spanIDs */, batchBytesLimit,
 		rf.rowLimitToKeyLimit(rowLimitHint), false, /* spansCanOverlap */
 	); err != nil {
 		return err
@@ -954,7 +964,7 @@ func (rf *Fetcher) processKV(
 			if err != nil {
 				break
 			}
-			prettyKey, prettyValue, err = rf.processValueBytes(ctx, table, kv, tupleBytes, prettyKey)
+			prettyKey, prettyValue, err = rf.processValueBytes(table, tupleBytes, prettyKey)
 		default:
 			var familyID uint64
 			_, familyID, err = encoding.DecodeUvarintAscending(rf.keyRemainingBytes)
@@ -984,7 +994,7 @@ func (rf *Fetcher) processKV(
 							errors.Errorf("single entry value with no default column id for key %s", prettyKey)
 					}
 				} else {
-					prettyKey, prettyValue, err = rf.processValueSingle(ctx, table, defaultColumnID, kv, prettyKey)
+					prettyKey, prettyValue, err = rf.processValueSingle(table, defaultColumnID, kv, prettyKey)
 				}
 			}
 		}
@@ -1033,9 +1043,7 @@ func (rf *Fetcher) processKV(
 		}
 
 		if len(valueBytes) > 0 {
-			prettyKey, prettyValue, err = rf.processValueBytes(
-				ctx, table, kv, valueBytes, prettyKey,
-			)
+			prettyKey, prettyValue, err = rf.processValueBytes(table, valueBytes, prettyKey)
 			if err != nil {
 				return "", "", scrub.WrapError(scrub.IndexValueDecodingError, err)
 			}
@@ -1052,20 +1060,13 @@ func (rf *Fetcher) processKV(
 // processValueSingle processes the given value (of column colID), setting
 // values in table.row accordingly. The key is only used for logging.
 func (rf *Fetcher) processValueSingle(
-	ctx context.Context,
-	table *tableInfo,
-	colID descpb.ColumnID,
-	kv roachpb.KeyValue,
-	prettyKeyPrefix string,
+	table *tableInfo, colID descpb.ColumnID, kv roachpb.KeyValue, prettyKeyPrefix string,
 ) (prettyKey string, prettyValue string, err error) {
 	prettyKey = prettyKeyPrefix
 	idx, ok := table.colIdxMap.Get(colID)
 	if !ok {
 		// No need to unmarshal the column value. Either the column was part of
 		// the index key or it isn't needed.
-		if DebugRowFetch {
-			log.Infof(ctx, "Scan %s -> [%d] (skipped)", kv.Key, colID)
-		}
 		return prettyKey, "", nil
 	}
 
@@ -1089,18 +1090,11 @@ func (rf *Fetcher) processValueSingle(
 		prettyValue = value.String()
 	}
 	table.row[idx] = rowenc.DatumToEncDatum(typ, value)
-	if DebugRowFetch {
-		log.Infof(ctx, "Scan %s -> %v", kv.Key, value)
-	}
 	return prettyKey, prettyValue, nil
 }
 
 func (rf *Fetcher) processValueBytes(
-	ctx context.Context,
-	table *tableInfo,
-	kv roachpb.KeyValue,
-	valueBytes []byte,
-	prettyKeyPrefix string,
+	table *tableInfo, valueBytes []byte, prettyKeyPrefix string,
 ) (prettyKey string, prettyValue string, err error) {
 	prettyKey = prettyKeyPrefix
 	if rf.args.TraceKV {
@@ -1109,56 +1103,21 @@ func (rf *Fetcher) processValueBytes(
 		}
 		rf.prettyValueBuf.Reset()
 	}
-
-	var colIDDiff uint32
-	var lastColID descpb.ColumnID
-	var typeOffset, dataOffset int
-	var typ encoding.Type
-	for len(valueBytes) > 0 && rf.valueColsFound < table.neededValueCols {
-		typeOffset, dataOffset, colIDDiff, typ, err = encoding.DecodeValueTag(valueBytes)
-		if err != nil {
-			return "", "", err
-		}
-		colID := lastColID + descpb.ColumnID(colIDDiff)
-		lastColID = colID
-		idx, ok := table.colIdxMap.Get(colID)
-		if !ok {
-			// This column wasn't requested, so read its length and skip it.
-			numBytes, err := encoding.PeekValueLengthWithOffsetsAndType(valueBytes, dataOffset, typ)
-			if err != nil {
-				return "", "", err
-			}
-			valueBytes = valueBytes[numBytes:]
-			if DebugRowFetch {
-				log.Infof(ctx, "Scan %s -> [%d] (skipped)", kv.Key, colID)
-			}
-			continue
-		}
-
-		if rf.args.TraceKV {
-			prettyKey = fmt.Sprintf("%s/%s", prettyKey, table.spec.FetchedColumns[idx].Name)
-		}
-
-		var encValue rowenc.EncDatum
-		encValue, valueBytes, err = rowenc.EncDatumValueFromBufferWithOffsetsAndType(valueBytes, typeOffset,
-			dataOffset, typ)
-		if err != nil {
-			return "", "", err
-		}
-		if rf.args.TraceKV {
-			err := encValue.EnsureDecoded(table.spec.FetchedColumns[idx].Type, rf.args.Alloc)
-			if err != nil {
-				return "", "", err
-			}
-			fmt.Fprintf(rf.prettyValueBuf, "/%v", encValue.Datum)
-		}
-		table.row[idx] = encValue
-		rf.valueColsFound++
-		if DebugRowFetch {
-			log.Infof(ctx, "Scan %d -> %v", idx, encValue)
-		}
+	neededCols := rf.table.neededValueCols - rf.valueColsFound
+	colOrds, err := rowenc.DecodeValueBytes(table.colIdxMap, valueBytes, neededCols, table.row)
+	if err != nil {
+		return "", "", err
 	}
+	rf.valueColsFound += colOrds.Len()
 	if rf.args.TraceKV {
+		for colOrd, ok := colOrds.Next(0); ok; colOrd, ok = colOrds.Next(colOrd + 1) {
+			prettyKey = fmt.Sprintf("%s/%s", prettyKey, table.spec.FetchedColumns[colOrd].Name)
+			err = table.row[colOrd].EnsureDecoded(table.spec.FetchedColumns[colOrd].Type, rf.args.Alloc)
+			if err != nil {
+				return "", "", err
+			}
+			fmt.Fprintf(rf.prettyValueBuf, "/%v", table.row[colOrd].Datum)
+		}
 		prettyValue = rf.prettyValueBuf.String()
 	}
 	return prettyKey, prettyValue, nil

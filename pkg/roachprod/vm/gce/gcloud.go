@@ -188,8 +188,10 @@ type jsonVM struct {
 	MachineType string
 	// CPU platform corresponding to machine type; see https://cloud.google.com/compute/docs/cpu-platforms
 	CPUPlatform string
-	SelfLink    string
-	Zone        string
+	// Of the form  "https://www.googleapis.com/compute/v1/projects/cockroach-workers/zones/us-central1-a/instances/...".
+	// N.B. The self-link contains the name of the GCE project.
+	SelfLink string
+	Zone     string
 	instanceDisksResponse
 }
 
@@ -261,6 +263,16 @@ func (jsonVM *jsonVM) toVM(project string, dnsDomain string) (ret *vm.VM) {
 		}
 
 	}
+	// Parse jsonVM.SelfLink to extract the project name.
+	// N.B. The self-link contains the name of the GCE project. E.g.,
+	// "https://www.googleapis.com/compute/v1/projects/cockroach-workers/zones/us-central1-a/instances/..."
+	projectName := ""
+	if idx := strings.Index(jsonVM.SelfLink, "/projects/"); idx != -1 {
+		projectName = jsonVM.SelfLink[idx+len("/projects/"):]
+		if idx := strings.Index(projectName, "/"); idx != -1 {
+			projectName = projectName[:idx]
+		}
+	}
 
 	return &vm.VM{
 		Name:                   jsonVM.Name,
@@ -274,6 +286,7 @@ func (jsonVM *jsonVM) toVM(project string, dnsDomain string) (ret *vm.VM) {
 		Provider:               ProviderName,
 		DNSProvider:            ProviderName,
 		ProviderID:             jsonVM.Name,
+		ProviderAccountID:      projectName,
 		PublicIP:               publicIP,
 		PublicDNS:              fmt.Sprintf("%s.%s", jsonVM.Name, dnsDomain),
 		RemoteUser:             remoteUser,
@@ -328,6 +341,7 @@ type ProviderOpts struct {
 	// multiple projects or a single one.
 	MachineType      string
 	MinCPUPlatform   string
+	BootDiskType     string
 	Zones            []string
 	Image            string
 	SSDCount         int
@@ -340,6 +354,12 @@ type ProviderOpts struct {
 	// Use an instance template and a managed instance group to create VMs. This
 	// enables cluster resizing, load balancing, and health monitoring.
 	Managed bool
+	// Enable turbo mode for the instance. Only supported on C4 VM families.
+	// See: https://cloud.google.com/sdk/docs/release-notes#compute_engine_23
+	TurboMode string
+	// The number of visible threads per physical core.
+	// See: https://cloud.google.com/compute/docs/instances/configuring-simultaneous-multithreading.
+	ThreadsPerCore int
 	// This specifies a subset of the Zones above that will run on spot instances.
 	// VMs running in Zones not in this list will be provisioned on-demand. This
 	// is only used by managed instance groups.
@@ -439,6 +459,12 @@ func (p *Provider) GetHostErrorVMs(
 		hostErrorVMs = append(hostErrorVMs, logEntry.ProtoPayload.ResourceName)
 	}
 	return hostErrorVMs, nil
+}
+
+func (p *Provider) GetLiveMigrationVMs(
+	l *logger.Logger, vms vm.List, since time.Time,
+) ([]string, error) {
+	return nil, nil
 }
 
 // GetVMSpecs returns a map from VM.Name to a map of VM attributes, provided by GCE
@@ -1077,6 +1103,8 @@ func (o *ProviderOpts) ConfigureCreateFlags(flags *pflag.FlagSet) {
 
 	flags.StringVar(&o.MachineType, ProviderName+"-machine-type", "n2-standard-4",
 		"Machine type (see https://cloud.google.com/compute/docs/machine-types)")
+	flags.StringVar(&o.BootDiskType, ProviderName+"-boot-disk-type", "pd-ssd",
+		"Type of the boot disk volume")
 	flags.StringVar(&o.MinCPUPlatform, ProviderName+"-min-cpu-platform", "Intel Ice Lake",
 		"Minimum CPU platform (see https://cloud.google.com/compute/docs/instances/specify-min-cpu-platform)")
 	flags.StringVar(&o.Image, ProviderName+"-image", DefaultImage,
@@ -1111,6 +1139,10 @@ func (o *ProviderOpts) ConfigureCreateFlags(flags *pflag.FlagSet) {
 		"use a managed instance group (enables resizing, load balancing, and health monitoring)")
 	flags.BoolVar(&o.EnableCron, ProviderName+"-enable-cron",
 		false, "Enables the cron service (it is disabled by default)")
+	flags.StringVar(&o.TurboMode, ProviderName+"-turbo-mode", "",
+		"enable turbo mode for the instance (only supported on C4 VM families, valid value: 'ALL_CORE_MAX')")
+	flags.IntVar(&o.ThreadsPerCore, ProviderName+"-threads-per-core", 0,
+		"the number of visible threads per physical core (valid values: 1 or 2), default is 0 (auto)")
 }
 
 // ConfigureProviderFlags implements Provider
@@ -1371,7 +1403,7 @@ func (p *Provider) computeInstanceArgs(
 		"--scopes", "cloud-platform",
 		"--image", image,
 		"--image-project", imageProject,
-		"--boot-disk-type", "pd-ssd",
+		"--boot-disk-type", providerOpts.BootDiskType,
 	}
 
 	if project == p.defaultProject && providerOpts.ServiceAccount == "" {
@@ -1379,6 +1411,12 @@ func (p *Provider) computeInstanceArgs(
 	}
 	if providerOpts.ServiceAccount != "" {
 		args = append(args, "--service-account", providerOpts.ServiceAccount)
+	}
+	if providerOpts.TurboMode != "" {
+		args = append(args, "--turbo-mode", providerOpts.TurboMode)
+	}
+	if providerOpts.ThreadsPerCore > 0 {
+		args = append(args, "--threads-per-core", fmt.Sprintf("%d", providerOpts.ThreadsPerCore))
 	}
 
 	if providerOpts.preemptible {
@@ -1620,6 +1658,11 @@ func (p *Provider) Create(
 			return nil, err
 		}
 	}
+	if providerOpts.TurboMode != "" {
+		if err := checkSDKVersion("492.0.0" /* minVersion */, "required for turbo-mode setting"); err != nil {
+			return nil, err
+		}
+	}
 
 	instanceArgs, cleanUpFn, err := p.computeInstanceArgs(l, opts, providerOpts)
 	if cleanUpFn != nil {
@@ -1781,6 +1824,33 @@ func computeGrowDistribution(groups []jsonManagedInstanceGroup, newNodeCount int
 	return addCount
 }
 
+// computeHostNamesPerZone distributes VM hostnames across zones based on the required
+// node count. Groups must be sorted by size from smallest to largest before passing to
+// this function. It takes instance groups, available hostnames, and the number of new nodes,
+// then returns a mapping of zones to their assigned hostnames.
+func computeHostNamesPerZone(
+	groups []jsonManagedInstanceGroup, vmNames []string, newNodeCount int,
+) map[string][]string {
+	addCounts := computeGrowDistribution(groups, newNodeCount)
+	zoneToHostNames := make(map[string][]string)
+	nameIndex := 0
+	for idx, group := range groups {
+		addCount := addCounts[idx]
+		if addCount == 0 {
+			continue
+		}
+
+		vmNamesForZone := make([]string, addCount)
+		for i := 0; i < addCount; i++ {
+			vmNamesForZone[i] = vmNames[nameIndex]
+			nameIndex++
+		}
+
+		zoneToHostNames[group.Zone] = vmNamesForZone
+	}
+	return zoneToHostNames
+}
+
 // Shrink shrinks the cluster by deleting the given VMs. This is only supported
 // for managed instance groups. Currently, nodes should only be deleted from the
 // tail of the cluster, due to complexities thar arise when the node names are
@@ -1838,22 +1908,17 @@ func (p *Provider) Grow(
 	sort.Slice(groups, func(i, j int) bool {
 		return groups[i].Size < groups[j].Size
 	})
-	addCounts := computeGrowDistribution(groups, newNodeCount)
+	zoneToHostNames := computeHostNamesPerZone(groups, names, newNodeCount)
 
-	zoneToHostNames := make(map[string][]string)
 	addedVms := make(map[string]bool)
 	var g errgroup.Group
-	for idx, group := range groups {
-		addCount := addCounts[idx]
-		if addCount == 0 {
-			continue
-		}
+	for _, group := range groups {
 		createArgs := []string{"compute", "instance-groups", "managed", "create-instance", "--zone", group.Zone, groupName,
 			"--project", project}
-		for i := 0; i < addCount; i++ {
-			addedVms[names[i]] = true
-			argsWithName := append(createArgs[:len(createArgs):len(createArgs)], []string{"--instance", names[i]}...)
-			zoneToHostNames[group.Zone] = append(zoneToHostNames[group.Zone], names[i])
+		for _, vmName := range zoneToHostNames[group.Zone] {
+			vmName := vmName
+			addedVms[vmName] = true
+			argsWithName := append(createArgs[:len(createArgs):len(createArgs)], []string{"--instance", vmName}...)
 			g.Go(func() error {
 				cmd := exec.Command("gcloud", argsWithName...)
 				output, err := cmd.CombinedOutput()
@@ -2471,7 +2536,7 @@ type jsonInstanceTemplate struct {
 }
 
 func (t *jsonInstanceTemplate) getZone() string {
-	namePrefix := instanceTemplateNamePrefix(t.Properties.Labels[vm.TagCluster])
+	namePrefix := fmt.Sprintf("%s-", instanceTemplateNamePrefix(t.Properties.Labels[vm.TagCluster]))
 	return strings.TrimPrefix(t.Name, namePrefix)
 }
 
@@ -2500,7 +2565,7 @@ func (d *jsonInstanceTemplateDisk) toVolume(vmName, zone string) (*vm.Volume, Vo
 	diskSize, _ := strconv.Atoi(d.InitializeParams.DiskSizeGb)
 
 	// This is a scratch disk.
-	if d.InitializeParams.DiskType == "SCRATCH" {
+	if d.Type == "SCRATCH" {
 		return &vm.Volume{
 			Size:               diskSize,
 			ProviderVolumeType: "local-ssd",
@@ -2958,9 +3023,17 @@ func (p *Provider) List(l *logger.Logger, opts vm.ListOptions) (vm.List, error) 
 		args := []string{"compute", "instances", "list", "--project", prj, "--format", "json"}
 
 		// Run the command, extracting the JSON payload
-		jsonVMS := make([]jsonVM, 0)
-		if err := runJSONCommand(args, &jsonVMS); err != nil {
+		allVMS := make([]jsonVM, 0)
+		if err := runJSONCommand(args, &allVMS); err != nil {
 			return nil, err
+		}
+		jsonVMS := make([]jsonVM, 0)
+		// Remove instances that weren't created by roachprod.
+		// N.B. The same filter is applied in other providers, i.e., aws and azure.
+		for _, v := range allVMS {
+			if v.Labels[vm.TagRoachprod] == "true" {
+				jsonVMS = append(jsonVMS, v)
+			}
 		}
 
 		// Find all instance templates that are currently in use.

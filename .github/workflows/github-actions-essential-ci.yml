@@ -49,12 +49,12 @@ on:
       - "!staging-v23.1*"
       - "!staging-v23.2*"
 concurrency:
-  group: ${{ github.head_ref || github.run_id }}
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
   cancel-in-progress: true
 jobs:
   acceptance:
     runs-on: [self-hosted, basic_big_runner_group]
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
         with:
@@ -75,7 +75,7 @@ jobs:
         if: always()
   check_generated_code:
     runs-on: [self-hosted, basic_runner_group]
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
         with:
@@ -90,7 +90,7 @@ jobs:
         if: always()
   docker_image_amd64:
     runs-on: [self-hosted, basic_runner_group]
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
         with:
@@ -111,7 +111,7 @@ jobs:
         if: always()
   examples_orms:
     runs-on: [self-hosted, basic_big_runner_group]
-    timeout-minutes: 40
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
         with:
@@ -132,7 +132,7 @@ jobs:
         if: always()
   lint:
     runs-on: [self-hosted, basic_big_runner_group]
-    timeout-minutes: 60
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
         with:
@@ -156,7 +156,7 @@ jobs:
         if: always()
   local_roachtest:
     runs-on: [self-hosted, basic_big_runner_group]
-    timeout-minutes: 60
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
         with:
@@ -168,6 +168,10 @@ jobs:
       - name: run local roachtests
         run: ./build/github/local-roachtest.sh crosslinux
       - uses: actions/upload-artifact@v4
+        with:
+          name: local_roachtest_test_summary.tsv
+          path: artifacts/test_summary.tsv
+      - uses: actions/upload-artifact@v4
         if: ${{ failure() }}
         with:
           name: local roachtest artifacts
@@ -177,7 +181,7 @@ jobs:
         if: always()
   local_roachtest_fips:
     runs-on: [self-hosted, basic_runner_group_fips]
-    timeout-minutes: 60
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
         with:
@@ -189,6 +193,10 @@ jobs:
       - name: run local roachtests
         run: ./build/github/local-roachtest.sh crosslinuxfips
       - uses: actions/upload-artifact@v4
+        with:
+          name: local_roachtest_fips_test_summary.tsv
+          path: artifacts/test_summary.tsv
+      - uses: actions/upload-artifact@v4
         if: ${{ failure() }}
         with:
           name: local roachtest (FIPS) artifacts
@@ -198,7 +206,7 @@ jobs:
         if: always()
   linux_amd64_build:
     runs-on: [self-hosted, basic_runner_group]
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
         with:
@@ -219,7 +227,7 @@ jobs:
         if: always()
   linux_amd64_fips_build:
     runs-on: [self-hosted, basic_runner_group]
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
         with:
@@ -238,72 +246,9 @@ jobs:
       - name: clean up
         run: ./build/github/cleanup-engflow-keys.sh
         if: always()
-  linux_arm64_build:
-    runs-on: [self-hosted, basic_runner_group]
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.pull_request.head.sha || github.ref }}
-      - name: compute metadata
-        run: echo GITHUB_ACTIONS_BRANCH=${{ github.event.pull_request.number || github.ref_name}} >> "$GITHUB_ENV"
-      - run: ./build/github/get-engflow-keys.sh
-      - run: ./build/github/prepare-summarize-build.sh
-      - name: build
-        run: ./build/github/build.sh crosslinuxarm
-      - name: upload build results
-        run: ./build/github/summarize-build.sh bes.bin
-        if: always()
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - name: clean up
-        run: ./build/github/cleanup-engflow-keys.sh
-        if: always()
-  macos_amd64_build:
-    runs-on: [self-hosted, basic_runner_group]
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.pull_request.head.sha || github.ref }}
-      - name: compute metadata
-        run: echo GITHUB_ACTIONS_BRANCH=${{ github.event.pull_request.number || github.ref_name}} >> "$GITHUB_ENV"
-      - run: ./build/github/get-engflow-keys.sh
-      - run: ./build/github/prepare-summarize-build.sh
-      - name: build
-        run: ./build/github/build.sh crossmacos
-      - name: upload build results
-        run: ./build/github/summarize-build.sh bes.bin
-        if: always()
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - name: clean up
-        run: ./build/github/cleanup-engflow-keys.sh
-        if: always()
-  macos_arm64_build:
-    runs-on: [self-hosted, basic_runner_group]
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.pull_request.head.sha || github.ref }}
-      - name: compute metadata
-        run: echo GITHUB_ACTIONS_BRANCH=${{ github.event.pull_request.number || github.ref_name}} >> "$GITHUB_ENV"
-      - run: ./build/github/get-engflow-keys.sh
-      - run: ./build/github/prepare-summarize-build.sh
-      - name: build
-        run: ./build/github/build.sh crossmacosarm
-      - name: upload build results
-        run: ./build/github/summarize-build.sh bes.bin
-        if: always()
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - name: clean up
-        run: ./build/github/cleanup-engflow-keys.sh
-        if: always()
   unit_tests:
     runs-on: [self-hosted, basic_runner_group]
-    timeout-minutes: 60
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
         with:
@@ -324,25 +269,3 @@ jobs:
       - name: clean up
         run: ./build/github/cleanup-engflow-keys.sh
         if: always()
-  windows_build:
-    runs-on: [self-hosted, basic_runner_group]
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.pull_request.head.sha || github.ref }}
-      - name: compute metadata
-        run: echo GITHUB_ACTIONS_BRANCH=${{ github.event.pull_request.number || github.ref_name}} >> "$GITHUB_ENV"
-      - run: ./build/github/get-engflow-keys.sh
-      - run: ./build/github/prepare-summarize-build.sh
-      - name: build
-        run: ./build/github/build.sh crosswindows
-      - name: upload build results
-        run: ./build/github/summarize-build.sh bes.bin
-        if: always()
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - name: clean up
-        run: ./build/github/cleanup-engflow-keys.sh
-        if: always()
-

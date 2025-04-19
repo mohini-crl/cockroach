@@ -461,6 +461,11 @@ type TableDescriptor interface {
 	// produced by AllIndexes and removing indexes with empty expressions.
 	PartialIndexes() []Index
 
+	// VectorIndexes returns a slice of all vector indexes in the underlying
+	// proto, in their canonical order. This is equivalent to taking the slice
+	// produced by AllIndexes and removing indexes which are not vector indexes.
+	VectorIndexes() []Index
+
 	// PublicNonPrimaryIndexes returns a slice of all active secondary indexes,
 	// in their canonical order. This is equivalent to the Indexes array in the
 	// proto.
@@ -713,6 +718,10 @@ type TableDescriptor interface {
 	// EnforcedCheckConstraints returns the subset of check constraints in
 	// EnforcedConstraints for this table, in the same order.
 	EnforcedCheckConstraints() []CheckConstraint
+	// EnforcedCheckValidators returns all check constraints that should
+	// be validated for violations, including both actual check constraints and
+	// any synthetic ones added (e.g., for row-level security).
+	EnforcedCheckValidators() []CheckConstraintValidator
 
 	// OutboundForeignKeys returns the subset of foreign key constraints in
 	// AllConstraints for this table, in the same order.
@@ -787,6 +796,9 @@ type TableDescriptor interface {
 	// AutoPartialStatsCollectionEnabled indicates if automatic partial statistics
 	// collection is explicitly enabled or disabled for this table.
 	AutoPartialStatsCollectionEnabled() catpb.AutoPartialStatsCollectionStatus
+	// AutoFullStatsCollectionEnabled indicates if automatic full statistics
+	// collection is explicitly enabled or disabled for this table.
+	AutoFullStatsCollectionEnabled() catpb.AutoFullStatsCollectionStatus
 	// AutoStatsMinStaleRows indicates the setting of
 	// sql_stats_automatic_collection_min_stale_rows for this table.
 	// If ok is true, then the minStaleRows value is valid, otherwise this has not

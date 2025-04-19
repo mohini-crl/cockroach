@@ -17,7 +17,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/clusterunique"
 	"github.com/cockroachdb/cockroach/pkg/sql/execstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 )
 
@@ -55,40 +54,50 @@ type AggregatedTransactionVisitor func(appName string, statistics *appstatspb.Tx
 
 // RecordedStmtStats stores the statistics of a statement to be recorded.
 type RecordedStmtStats struct {
-	SessionID            clusterunique.ID
-	StatementID          clusterunique.ID
-	TransactionID        uuid.UUID
-	AutoRetryCount       int
-	Failed               bool
-	AutoRetryReason      error
-	RowsAffected         int
-	IdleLatencySec       float64
-	ParseLatencySec      float64
-	PlanLatencySec       float64
-	RunLatencySec        float64
-	ServiceLatencySec    float64
-	OverheadLatencySec   float64
-	BytesRead            int64
-	RowsRead             int64
-	RowsWritten          int64
-	Nodes                []int64
-	KVNodeIDs            []int32
-	StatementType        tree.StatementType
-	Plan                 *appstatspb.ExplainTreePlanNode
-	PlanGist             string
-	StatementError       error
-	IndexRecommendations []string
-	Query                string
-	StartTime            time.Time
-	EndTime              time.Time
-	FullScan             bool
-	ExecStats            *execstats.QueryLevelStats
-	Indexes              []string
-	Database             string
+	FingerprintID            appstatspb.StmtFingerprintID
+	Query                    string
+	App                      string
+	DistSQL                  bool
+	ImplicitTxn              bool
+	Vec                      bool
+	FullScan                 bool
+	Database                 string
+	PlanHash                 uint64
+	QuerySummary             string
+	TransactionFingerprintID appstatspb.TransactionFingerprintID
+	SessionID                clusterunique.ID
+	StatementID              clusterunique.ID
+	TransactionID            uuid.UUID
+	AutoRetryCount           int
+	Failed                   bool
+	Generic                  bool
+	AutoRetryReason          error
+	RowsAffected             int
+	IdleLatencySec           float64
+	ParseLatencySec          float64
+	PlanLatencySec           float64
+	RunLatencySec            float64
+	ServiceLatencySec        float64
+	OverheadLatencySec       float64
+	BytesRead                int64
+	RowsRead                 int64
+	RowsWritten              int64
+	Nodes                    []int64
+	KVNodeIDs                []int32
+	StatementType            tree.StatementType
+	Plan                     *appstatspb.ExplainTreePlanNode
+	PlanGist                 string
+	StatementError           error
+	IndexRecommendations     []string
+	StartTime                time.Time
+	EndTime                  time.Time
+	ExecStats                *execstats.QueryLevelStats
+	Indexes                  []string
 }
 
 // RecordedTxnStats stores the statistics of a transaction to be recorded.
 type RecordedTxnStats struct {
+	FingerprintID           appstatspb.TransactionFingerprintID
 	SessionID               clusterunique.ID
 	TransactionID           uuid.UUID
 	TransactionTimeSec      float64
@@ -110,6 +119,24 @@ type RecordedTxnStats struct {
 	RowsWritten             int64
 	BytesRead               int64
 	Priority                roachpb.UserPriority
-	SessionData             *sessiondata.SessionData
 	TxnErr                  error
+	Application             string
+	// Normalized user name.
+	UserNormalized string
+}
+
+// SSDrainer is the interface for draining or resetting sql stats.
+type SSDrainer interface {
+	// DrainStats Stats that are drained will permanently be removed from their
+	// source. Once the stats are drained, they cannot be processed again.
+	// DrainStats returns the collected statement and transaction statistics, as
+	// well as the total number of fingerprints drained.
+	DrainStats(ctx context.Context) (
+		[]*appstatspb.CollectedStatementStatistics,
+		[]*appstatspb.CollectedTransactionStatistics,
+		int64,
+	)
+	// Reset will reset all the stats in the drainer. Once reset, the stats will
+	// be lost.
+	Reset(ctx context.Context) error
 }

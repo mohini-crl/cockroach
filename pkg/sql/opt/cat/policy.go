@@ -8,6 +8,7 @@ package cat
 import (
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 )
 
@@ -37,14 +38,22 @@ type Policy struct {
 	// Name is the name of the policy. The name is unique within a table
 	// and cannot be qualified.
 	Name tree.Name
+	// ID is the unique identifier for this policy within the table.
+	ID descpb.PolicyID
 	// UsingExpr is the optional filter expression evaluated on rows during
 	// read operations. If the policy does not define a USING expression, this is
 	// an empty string.
 	UsingExpr string
+	// UsingColumnIDs is a set of column IDs that are referenced in the USING
+	// expression.
+	UsingColumnIDs descpb.ColumnIDs
 	// WithCheckExpr is the optional validation expression applied to new rows
 	// during write operations. If the policy does not define a WITH CHECK expression,
 	// this is an empty string.
 	WithCheckExpr string
+	// WithCheckColumnIDs is a set of column IDs that are referenced in the WITH
+	// CHECK expression.
+	WithCheckColumnIDs descpb.ColumnIDs
 	// Command is the command that the policy was defined for.
 	Command catpb.PolicyCommand
 	// roles are the roles the applies to. If the policy applies to all roles (aka

@@ -90,6 +90,12 @@ var (
 		Measurement: "Replicas",
 		Unit:        metric.Unit_COUNT,
 	}
+	metaAsleepCount = metric.Metadata{
+		Name:        "replicas.asleep",
+		Help:        "Number of asleep replicas. Similarly to quiesced replicas, asleep replicas do not tick in Raft.",
+		Measurement: "Replicas",
+		Unit:        metric.Unit_COUNT,
+	}
 	metaUninitializedCount = metric.Metadata{
 		Name:        "replicas.uninitialized",
 		Help:        "Number of uninitialized replicas, this does not include uninitialized replicas that can lie dormant in a persistent state.",
@@ -177,6 +183,12 @@ var (
 		Name:        "leases.transfers.error",
 		Help:        "Number of failed lease transfers",
 		Measurement: "Lease Transfers",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaLeaseTransferLocksWrittenCount = metric.Metadata{
+		Name:        "leases.transfers.locks_written",
+		Help:        "Number of locks written to storage during lease transfers",
+		Measurement: "Locks Written",
 		Unit:        metric.Unit_COUNT,
 	}
 	metaLeaseExpirationCount = metric.Metadata{
@@ -1016,6 +1028,20 @@ bytes preserved during flushes and compactions over the lifetime of the process.
 		Measurement: "Bytes",
 		Unit:        metric.Unit_BYTES,
 	}
+	metaSSTableRemoteBytes = metric.Metadata{
+		Name: "storage.sstable.remote.bytes",
+		Help: "Bytes in SSTables that are stored off-disk (remotely) " +
+			"in object storage.",
+		Measurement: "Bytes",
+		Unit:        metric.Unit_BYTES,
+	}
+	metaSSTableRemoteCount = metric.Metadata{
+		Name: "storage.sstable.remote.count",
+		Help: "Count of SSTables that are stored off-disk (remotely) " +
+			"in object storage.",
+		Measurement: "SSTables",
+		Unit:        metric.Unit_COUNT,
+	}
 	metaSSTableCompressionSnappy = metric.Metadata{
 		Name: "storage.sstable.compression.snappy.count",
 		Help: "Count of SSTables that have been compressed with the snappy " +
@@ -1785,6 +1811,19 @@ difficult to meaningfully interpret this metric.`,
 		Help:        "Number of Raft log entries truncated",
 		Measurement: "Log Entries",
 		Unit:        metric.Unit_COUNT,
+	}
+
+	metaRaftLogTotalSize = metric.Metadata{
+		Name:        "raftlog.size.total",
+		Help:        "Approximate size of all Raft logs on the store.",
+		Measurement: "Bytes",
+		Unit:        metric.Unit_BYTES,
+	}
+	metaRaftLogMaxSize = metric.Metadata{
+		Name:        "raftlog.size.max",
+		Help:        "Approximate size of the largest Raft log on the store.",
+		Measurement: "Bytes",
+		Unit:        metric.Unit_BYTES,
 	}
 
 	metaRaftFollowerPaused = metric.Metadata{
@@ -2614,6 +2653,7 @@ type StoreMetrics struct {
 	RaftLeaderInvalidLeaseCount   *metric.Gauge
 	LeaseHolderCount              *metric.Gauge
 	QuiescentCount                *metric.Gauge
+	AsleepCount                   *metric.Gauge
 	UninitializedCount            *metric.Gauge
 	RaftFlowStateCounts           [tracker.StateCount]*metric.Gauge
 
@@ -2632,6 +2672,7 @@ type StoreMetrics struct {
 	LeaseRequestLatency            metric.IHistogram
 	LeaseTransferSuccessCount      *metric.Counter
 	LeaseTransferErrorCount        *metric.Counter
+	LeaseTransferLocksWritten      *metric.Counter
 	LeaseExpirationCount           *metric.Gauge
 	LeaseEpochCount                *metric.Gauge
 	LeaseLeaderCount               *metric.Gauge
@@ -2748,6 +2789,8 @@ type StoreMetrics struct {
 	BatchCommitWALRotWaitDuration     *metric.Counter
 	BatchCommitCommitWaitDuration     *metric.Counter
 	SSTableZombieBytes                *metric.Gauge
+	SSTableRemoteBytes                *metric.Gauge
+	SSTableRemoteCount                *metric.Gauge
 	SSTableCompressionSnappy          *metric.Gauge
 	SSTableCompressionZstd            *metric.Gauge
 	SSTableCompressionUnknown         *metric.Gauge
@@ -2860,6 +2903,8 @@ type StoreMetrics struct {
 	// Raft log metrics.
 	RaftLogFollowerBehindCount *metric.Gauge
 	RaftLogTruncated           *metric.Counter
+	RaftLogTotalSize           *metric.Gauge
+	RaftLogMaxSize             *metric.Gauge
 
 	RaftPausedFollowerCount       *metric.Gauge
 	RaftPausedFollowerDroppedMsgs *metric.Counter
@@ -3317,6 +3362,7 @@ func newStoreMetrics(histogramWindow time.Duration) *StoreMetrics {
 		RaftLeaderInvalidLeaseCount:   metric.NewGauge(metaRaftLeaderInvalidLeaseCount),
 		LeaseHolderCount:              metric.NewGauge(metaLeaseHolderCount),
 		QuiescentCount:                metric.NewGauge(metaQuiescentCount),
+		AsleepCount:                   metric.NewGauge(metaAsleepCount),
 		UninitializedCount:            metric.NewGauge(metaUninitializedCount),
 		RaftFlowStateCounts:           raftFlowStateGaugeSlice(),
 
@@ -3338,6 +3384,7 @@ func newStoreMetrics(histogramWindow time.Duration) *StoreMetrics {
 		}),
 		LeaseTransferSuccessCount:      metric.NewCounter(metaLeaseTransferSuccessCount),
 		LeaseTransferErrorCount:        metric.NewCounter(metaLeaseTransferErrorCount),
+		LeaseTransferLocksWritten:      metric.NewCounter(metaLeaseTransferLocksWrittenCount),
 		LeaseExpirationCount:           metric.NewGauge(metaLeaseExpirationCount),
 		LeaseEpochCount:                metric.NewGauge(metaLeaseEpochCount),
 		LeaseLeaderCount:               metric.NewGauge(metaLeaseLeaderCount),
@@ -3468,6 +3515,8 @@ func newStoreMetrics(histogramWindow time.Duration) *StoreMetrics {
 		BatchCommitWALRotWaitDuration:     metric.NewCounter(metaBatchCommitWALRotDuration),
 		BatchCommitCommitWaitDuration:     metric.NewCounter(metaBatchCommitCommitWaitDuration),
 		SSTableZombieBytes:                metric.NewGauge(metaSSTableZombieBytes),
+		SSTableRemoteBytes:                metric.NewGauge(metaSSTableRemoteBytes),
+		SSTableRemoteCount:                metric.NewGauge(metaSSTableRemoteCount),
 		SSTableCompressionSnappy:          metric.NewGauge(metaSSTableCompressionSnappy),
 		SSTableCompressionZstd:            metric.NewGauge(metaSSTableCompressionZstd),
 		SSTableCompressionUnknown:         metric.NewGauge(metaSSTableCompressionUnknown),
@@ -3627,6 +3676,8 @@ func newStoreMetrics(histogramWindow time.Duration) *StoreMetrics {
 		// Raft log metrics.
 		RaftLogFollowerBehindCount: metric.NewGauge(metaRaftLogFollowerBehindCount),
 		RaftLogTruncated:           metric.NewCounter(metaRaftLogTruncated),
+		RaftLogTotalSize:           metric.NewGauge(metaRaftLogTotalSize),
+		RaftLogMaxSize:             metric.NewGauge(metaRaftLogMaxSize),
 
 		RaftPausedFollowerCount:       metric.NewGauge(metaRaftFollowerPaused),
 		RaftPausedFollowerDroppedMsgs: metric.NewCounter(metaRaftPausedFollowerDroppedMsgs),
@@ -3902,7 +3953,7 @@ func (sm *StoreMetrics) updateEngineMetrics(m storage.Metrics) {
 	sm.SecondaryCacheEvictions.Update(m.SecondaryCacheMetrics.Evictions)
 	sm.SecondaryCacheWriteBackFails.Update(m.SecondaryCacheMetrics.WriteBackFailures)
 	sm.RdbL0Sublevels.Update(int64(m.Levels[0].Sublevels))
-	sm.RdbL0NumFiles.Update(m.Levels[0].NumFiles)
+	sm.RdbL0NumFiles.Update(m.Levels[0].TablesCount)
 	sm.RdbL0BytesFlushed.Update(int64(m.Levels[0].BytesFlushed))
 	sm.FlushableIngestCount.Update(int64(m.Flush.AsIngestCount))
 	sm.FlushableIngestTableCount.Update(int64(m.Flush.AsIngestTableCount))
@@ -3925,6 +3976,9 @@ func (sm *StoreMetrics) updateEngineMetrics(m storage.Metrics) {
 	sm.BatchCommitWALRotWaitDuration.Update(int64(m.BatchCommitStats.WALRotationDuration))
 	sm.BatchCommitCommitWaitDuration.Update(int64(m.BatchCommitStats.CommitWaitDuration))
 	sm.SSTableZombieBytes.Update(int64(m.Table.ZombieSize))
+	count, size := m.RemoteTablesTotal()
+	sm.SSTableRemoteBytes.Update(int64(size))
+	sm.SSTableRemoteCount.Update(int64(count))
 	sm.SSTableCompressionSnappy.Update(m.Table.CompressedCountSnappy)
 	sm.SSTableCompressionZstd.Update(m.Table.CompressedCountZstd)
 	sm.SSTableCompressionUnknown.Update(m.Table.CompressedCountUnknown)
@@ -3935,7 +3989,7 @@ func (sm *StoreMetrics) updateEngineMetrics(m storage.Metrics) {
 	totalWriteAmp := float64(0)
 	for level, stats := range m.Levels {
 		sm.RdbBytesIngested[level].Update(int64(stats.BytesIngested))
-		sm.RdbLevelSize[level].Update(stats.Size)
+		sm.RdbLevelSize[level].Update(stats.TablesSize)
 		sm.RdbLevelScore[level].Update(stats.Score)
 		totalWriteAmp += stats.WriteAmp()
 	}
@@ -4058,6 +4112,8 @@ func (sm *StoreMetrics) handleMetricsResult(ctx context.Context, metric result.M
 	metric.LeaseTransferSuccess = 0
 	sm.LeaseTransferErrorCount.Inc(int64(metric.LeaseTransferError))
 	metric.LeaseTransferError = 0
+	sm.LeaseTransferLocksWritten.Inc(int64(metric.LeaseTransferLocksWritten))
+	metric.LeaseTransferLocksWritten = 0
 
 	sm.ResolveCommitCount.Inc(int64(metric.ResolveCommit))
 	metric.ResolveCommit = 0

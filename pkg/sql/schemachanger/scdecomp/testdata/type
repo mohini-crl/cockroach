@@ -670,6 +670,7 @@ ElementState:
     tableId: 108
     temporaryIndexId: 0
     type: FORWARD
+    vecConfig: null
   Status: PUBLIC
 - SchemaChild:
     childObjectId: 108
@@ -687,6 +688,7 @@ ElementState:
     isNotVisible: false
     isUnique: false
     recreateSourceId: 0
+    recreateTargetId: 0
     referencedColumnIds:
     - 2
     sharding: null
@@ -697,6 +699,7 @@ ElementState:
     usesFunctionIds: []
     usesSequenceIds: []
     usesTypeIds: []
+    vecConfig: null
   Status: PUBLIC
 - Table:
     isTemporary: false
@@ -704,6 +707,9 @@ ElementState:
   Status: PUBLIC
 - TableData:
     databaseId: 100
+    tableId: 108
+  Status: PUBLIC
+- TableSchemaLocked:
     tableId: 108
   Status: PUBLIC
 - UniqueWithoutIndexConstraint:
@@ -1671,6 +1677,7 @@ ElementState:
     tableId: 111
     temporaryIndexId: 0
     type: FORWARD
+    vecConfig: null
   Status: PUBLIC
 - SchemaChild:
     childObjectId: 111
@@ -1688,6 +1695,7 @@ ElementState:
     isNotVisible: false
     isUnique: false
     recreateSourceId: 0
+    recreateTargetId: 0
     referencedColumnIds:
     - 2
     sharding: null
@@ -1698,6 +1706,7 @@ ElementState:
     usesFunctionIds: []
     usesSequenceIds: []
     usesTypeIds: []
+    vecConfig: null
   Status: PUBLIC
 - Table:
     isTemporary: false
@@ -1705,6 +1714,9 @@ ElementState:
   Status: PUBLIC
 - TableData:
     databaseId: 100
+    tableId: 111
+  Status: PUBLIC
+- TableSchemaLocked:
     tableId: 111
   Status: PUBLIC
 - UserPrivileges:

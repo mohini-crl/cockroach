@@ -69,7 +69,8 @@ func (s *topLevelServer) newTenantServer(
 		return nil, err
 	}
 
-	baseCfg, sqlCfg, err := s.makeSharedProcessTenantConfig(ctx, tenantID, portStartHint, tenantStopper, testArgs.Settings)
+	baseCfg, sqlCfg, err := s.makeSharedProcessTenantConfig(ctx, tenantID, tenantNameContainer.Get(), portStartHint,
+		tenantStopper, testArgs.Settings)
 	if err != nil {
 		return nil, err
 	}
@@ -146,6 +147,7 @@ func newTenantServerInternal(
 func (s *topLevelServer) makeSharedProcessTenantConfig(
 	ctx context.Context,
 	tenantID roachpb.TenantID,
+	tenantName roachpb.TenantName,
 	portStartHint int,
 	stopper *stop.Stopper,
 	testSettings *cluster.Settings,
@@ -164,7 +166,8 @@ func (s *topLevelServer) makeSharedProcessTenantConfig(
 		st.SV.TestingCopyForVirtualCluster(&testSettings.SV)
 	}
 
-	baseCfg, sqlCfg, err := makeSharedProcessTenantServerConfig(ctx, tenantID, portStartHint, parentCfg, localServerInfo, st, stopper, s.recorder)
+	baseCfg, sqlCfg, err := makeSharedProcessTenantServerConfig(ctx, tenantID, tenantName, portStartHint, parentCfg,
+		localServerInfo, st, stopper, s.recorder)
 	if err != nil {
 		return BaseConfig{}, SQLConfig{}, err
 	}
@@ -176,6 +179,7 @@ func (s *topLevelServer) makeSharedProcessTenantConfig(
 func makeSharedProcessTenantServerConfig(
 	ctx context.Context,
 	tenantID roachpb.TenantID,
+	tenantName roachpb.TenantName,
 	portStartHint int,
 	kvServerCfg Config,
 	kvServerInfo LocalKVServerInfo,
@@ -313,9 +317,11 @@ func makeSharedProcessTenantServerConfig(
 		useStore := tempStorageCfg.Spec
 		// TODO(knz): Make tempDir configurable.
 		tempDir := useStore.Path
-		if tempStorageCfg.Path, err = fs.CreateTempDir(tempDir, TempDirPrefix, stopper); err != nil {
+		var unlockDirFn func()
+		if tempStorageCfg.Path, unlockDirFn, err = fs.CreateTempDir(tempDir, TempDirPrefix); err != nil {
 			return BaseConfig{}, SQLConfig{}, errors.Wrap(err, "could not create temporary directory for temp storage")
 		}
+		stopper.AddCloser(stop.CloserFn(unlockDirFn))
 		if useStore.Path != "" {
 			recordPath := filepath.Join(useStore.Path, TempDirsRecordFilename)
 			if err := fs.RecordTempDir(recordPath, tempStorageCfg.Path); err != nil {
@@ -324,7 +330,7 @@ func makeSharedProcessTenantServerConfig(
 		}
 	}
 
-	sqlCfg = MakeSQLConfig(tenantID, tempStorageCfg)
+	sqlCfg = MakeSQLConfig(tenantID, tenantName, tempStorageCfg)
 	baseCfg.ExternalIODirConfig = kvServerCfg.BaseConfig.ExternalIODirConfig
 
 	baseCfg.ExternalIODir = kvServerCfg.BaseConfig.ExternalIODir

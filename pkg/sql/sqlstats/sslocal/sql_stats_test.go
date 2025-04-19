@@ -9,6 +9,7 @@ import (
 	"context"
 	gosql "database/sql"
 	"encoding/json"
+	"fmt"
 	"net/url"
 	"sort"
 	"strings"
@@ -29,7 +30,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
-	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessionphase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats/insights"
@@ -37,6 +37,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats/sslocal"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats/ssmemstorage"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/pgurlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util"
@@ -67,6 +68,7 @@ func TestStmtStatsBulkIngestWithRandomMetadata(t *testing.T) {
 		var stats serverpb.StatementsResponse_CollectedStatementStatistics
 		randomData := sqlstatstestutil.GetRandomizedCollectedStatementStatisticsForTest(t)
 		stats.Key.KeyData = randomData.Key
+		stats.ID = appstatspb.StmtFingerprintID(i)
 		testData = append(testData, stats)
 	}
 
@@ -88,7 +90,7 @@ func TestStmtStatsBulkIngestWithRandomMetadata(t *testing.T) {
 						break
 					}
 				}
-				require.True(t, found, "expected metadata %+v, but not found", statistics.Key)
+				require.True(t, found, "expected metadata %+v, but not found")
 				return nil
 			}))
 }
@@ -318,7 +320,7 @@ func TestNodeLocalInMemoryViewDoesNotReturnPersistedStats(t *testing.T) {
 	defer cluster.Stopper().Stop(ctx)
 	server := cluster.Server(0 /* idx */).ApplicationLayer()
 
-	// Open two connections so that we can run statements without messing up
+	// Open two connections so that we can run statementsBySessionID without messing up
 	// the SQL stats.
 	testConn := server.SQLConn(t)
 	sqlDB := sqlutils.MakeSQLRunner(testConn)
@@ -438,11 +440,10 @@ func TestExplicitTxnFingerprintAccounting(t *testing.T) {
 
 	st := cluster.MakeTestingClusterSettings()
 	monitor := mon.NewUnlimitedMonitor(ctx, mon.Options{
-		Name:     mon.MakeMonitorName("test"),
+		Name:     mon.MakeName("test"),
 		Settings: st,
 	})
 
-	insightsProvider := insights.New(st, insights.NewMetrics(), nil)
 	sqlStats := sslocal.New(
 		st,
 		sqlstats.MaxMemSQLStatsStmtFingerprints,
@@ -452,14 +453,17 @@ func TestExplicitTxnFingerprintAccounting(t *testing.T) {
 		monitor,
 		nil, /* reportingSink */
 		nil, /* knobs */
-		insightsProvider.Anomalies(),
 	)
+
+	// TODO(xinhaoz): We'll come back and add the sql stats sink once we
+	// enable the SQL stats ingestion for sql stats.
+	ingester := sslocal.NewSQLStatsIngester(nil /* testing knobs */)
 
 	appStats := sqlStats.GetApplicationStats("" /* appName */)
 	statsCollector := sslocal.NewStatsCollector(
 		st,
 		appStats,
-		insightsProvider.Writer(),
+		ingester,
 		sessionphase.NewTimes(),
 		sqlStats.GetCounters(),
 		false, /* underOuterTxn */
@@ -473,26 +477,19 @@ func TestExplicitTxnFingerprintAccounting(t *testing.T) {
 		defer func() {
 			statsCollector.EndTransaction(ctx, txnFingerprintID)
 			require.NoError(t,
-				statsCollector.
-					RecordTransaction(ctx, txnFingerprintID, sqlstats.RecordedTxnStats{
-						SessionData: &sessiondata.SessionData{
-							SessionData: sessiondatapb.SessionData{
-								UserProto:       username.RootUserName().EncodeProto(),
-								Database:        "defaultdb",
-								ApplicationName: "appname_findme",
-							},
-						},
-					}))
+				statsCollector.RecordTransaction(ctx, &sqlstats.RecordedTxnStats{
+					FingerprintID:  txnFingerprintID,
+					UserNormalized: username.RootUser,
+					Application:    "appname_findme",
+				}))
 		}()
 		for _, fingerprint := range testCase.fingerprints {
-			stmtFingerprintID, err := statsCollector.RecordStatement(
-				ctx,
-				appstatspb.StatementStatisticsKey{
-					Query:       fingerprint,
-					ImplicitTxn: testCase.implicit,
-				},
-				sqlstats.RecordedStmtStats{},
-			)
+			stmtFingerprintID := appstatspb.ConstructStatementFingerprintID(fingerprint, testCase.implicit, "defaultdb")
+			err := statsCollector.RecordStatement(ctx, &sqlstats.RecordedStmtStats{
+				FingerprintID: stmtFingerprintID,
+				Query:         fingerprint,
+				ImplicitTxn:   testCase.implicit,
+			})
 			require.NoError(t, err)
 			txnFingerprintIDHash.Add(uint64(stmtFingerprintID))
 		}
@@ -556,7 +553,7 @@ func TestAssociatingStmtStatsWithTxnFingerprint(t *testing.T) {
 	st := cluster.MakeTestingClusterSettings()
 	updater := st.MakeUpdater()
 	monitor := mon.NewUnlimitedMonitor(ctx, mon.Options{
-		Name:     mon.MakeMonitorName("test"),
+		Name:     mon.MakeName("test"),
 		Settings: st,
 	})
 
@@ -570,7 +567,7 @@ func TestAssociatingStmtStatsWithTxnFingerprint(t *testing.T) {
 		require.NoError(t, err)
 
 		// Construct the SQL Stats machinery.
-		insightsProvider := insights.New(st, insights.NewMetrics(), nil)
+		insightsProvider := insights.New(st, insights.NewMetrics())
 		sqlStats := sslocal.New(
 			st,
 			sqlstats.MaxMemSQLStatsStmtFingerprints,
@@ -580,13 +577,13 @@ func TestAssociatingStmtStatsWithTxnFingerprint(t *testing.T) {
 			monitor,
 			nil,
 			nil,
-			insightsProvider.Anomalies(),
 		)
+		ingester := sslocal.NewSQLStatsIngester(nil /* testing knobs */, insightsProvider)
 		appStats := sqlStats.GetApplicationStats("" /* appName */)
 		statsCollector := sslocal.NewStatsCollector(
 			st,
 			appStats,
-			insightsProvider.Writer(),
+			ingester,
 			sessionphase.NewTimes(),
 			sqlStats.GetCounters(),
 			false, /* underOuterTxn */
@@ -596,34 +593,28 @@ func TestAssociatingStmtStatsWithTxnFingerprint(t *testing.T) {
 		for _, txn := range simulatedTxns {
 			// Collect stats for the simulated transaction.
 			txnFingerprintIDHash := util.MakeFNV64()
-			statsCollector.StartTransaction()
-
 			for _, fingerprint := range txn.stmtFingerprints {
-				stmtFingerprintID, err := statsCollector.RecordStatement(
-					ctx,
-					appstatspb.StatementStatisticsKey{Query: fingerprint},
-					sqlstats.RecordedStmtStats{},
-				)
+				stmtFingerprintID := appstatspb.ConstructStatementFingerprintID(fingerprint, false, "defaultdb")
+				err := statsCollector.RecordStatement(ctx, &sqlstats.RecordedStmtStats{
+					FingerprintID: stmtFingerprintID,
+					Query:         fingerprint,
+				})
 				require.NoError(t, err)
 				txnFingerprintIDHash.Add(uint64(stmtFingerprintID))
 			}
 
 			transactionFingerprintID := appstatspb.TransactionFingerprintID(txnFingerprintIDHash.Sum())
 			statsCollector.EndTransaction(ctx, transactionFingerprintID)
-			err := statsCollector.RecordTransaction(ctx, transactionFingerprintID, sqlstats.RecordedTxnStats{
-				SessionData: &sessiondata.SessionData{
-					SessionData: sessiondatapb.SessionData{
-						UserProto:       username.RootUserName().EncodeProto(),
-						Database:        "defaultdb",
-						ApplicationName: "appname_findme",
-					},
-				},
+			err := statsCollector.RecordTransaction(ctx, &sqlstats.RecordedTxnStats{
+				FingerprintID:  transactionFingerprintID,
+				UserNormalized: username.RootUser,
+				Application:    "appname_findme",
 			})
 			require.NoError(t, err)
 
 			// Gather the collected stats so that we can assert on them.
 			var stats []*appstatspb.CollectedStatementStatistics
-			err = statsCollector.IterateStatementStats(
+			err = appStats.IterateStatementStats(
 				ctx,
 				sqlstats.IteratorOptions{},
 				func(_ context.Context, s *appstatspb.CollectedStatementStatistics) error {
@@ -740,7 +731,7 @@ func TestTransactionServiceLatencyOnExtendedProtocol(t *testing.T) {
 				finishedExecute.Store(true)
 			}
 		},
-		OnRecordTxnFinish: func(isInternal bool, phaseTimes *sessionphase.Times, stmt string, _ sqlstats.RecordedTxnStats) {
+		OnRecordTxnFinish: func(isInternal bool, phaseTimes *sessionphase.Times, stmt string, _ *sqlstats.RecordedTxnStats) {
 			tc.Lock()
 			defer tc.Unlock()
 			if !isInternal && tc.query == stmt && finishedExecute.Load() {
@@ -756,7 +747,7 @@ func TestTransactionServiceLatencyOnExtendedProtocol(t *testing.T) {
 	defer s.Stopper().Stop(ctx)
 	ts := s.ApplicationLayer()
 
-	pgURL, cleanupGoDB := sqlutils.PGUrl(
+	pgURL, cleanupGoDB := pgurlutils.PGUrl(
 		t, ts.AdvSQLAddr(), "StartServer", url.User(username.RootUser))
 	defer cleanupGoDB()
 	c, err := pgx.Connect(ctx, pgURL.String())
@@ -1326,6 +1317,21 @@ func TestSQLStatsIdleLatencies(t *testing.T) {
 			},
 		},
 		{
+			name:     "simple statement with rollback",
+			stmtLats: map[string]float64{"SELECT _": 0.1},
+			txnLat:   0.2,
+			ops: func(t *testing.T, db *gosql.DB) {
+				tx, err := db.Begin()
+				require.NoError(t, err)
+				time.Sleep(100 * time.Millisecond)
+				_, err = tx.Exec("SELECT 1")
+				require.NoError(t, err)
+				time.Sleep(100 * time.Millisecond)
+				err = tx.Rollback()
+				require.NoError(t, err)
+			},
+		},
+		{
 			name:     "compound statement",
 			stmtLats: map[string]float64{"SELECT _": 0.1, "SELECT count(*) FROM crdb_internal.statement_statistics": 0},
 			txnLat:   0.2,
@@ -1341,7 +1347,7 @@ func TestSQLStatsIdleLatencies(t *testing.T) {
 			},
 		},
 		{
-			name:     "multiple statements - slow generation",
+			name:     "multiple statementsBySessionID - slow generation",
 			stmtLats: map[string]float64{"SELECT pg_sleep(_)": 0, "SELECT _": 0},
 			txnLat:   0,
 			ops: func(t *testing.T, db *gosql.DB) {
@@ -1413,8 +1419,8 @@ func TestSQLStatsIdleLatencies(t *testing.T) {
 			// Make a separate connection to the database, to isolate the stats
 			// we'll observe.
 			// Note that we're not using pgx here because it *always* prepares
-			// statements, and we want to test our client latency measurements
-			// both with and without prepared statements.
+			// statementsBySessionID, and we want to test our client latency measurements
+			// both with and without prepared statementsBySessionID.
 			opsDB := s.SQLConn(t)
 
 			// Set a unique application name for our session, so we can find our
@@ -1442,7 +1448,7 @@ func TestSQLStatsIdleLatencies(t *testing.T) {
 					actual[query] = latency
 				}
 				require.NoError(t, rows.Err())
-				// Ensure that all test case statements have at least the
+				// Ensure that all test case statementsBySessionID have at least the
 				// minimum expected idle latency and do not exceed the safety
 				// check cap.
 				for tc_stmt, tc_latency := range tc.stmtLats {
@@ -1680,78 +1686,25 @@ func TestSQLStatsRegions(t *testing.T) {
 	}
 }
 
-// TestSQLStats_ConsumeStats validates that ConsumeStats function pops all statement and transaction stats from the
+// TestSQLStats_DrainStats validates that DrainSqlStats function pops all statement and transaction stats from the
 // in-memory stats and clears it.
-func TestSQLStats_ConsumeStats(t *testing.T) {
+func TestSQLStats_DrainStats(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
 	stopper := stop.NewStopper()
 	defer stopper.Stop(context.Background())
-
-	// Generate dummy stats to populate in-memory stats container.
-	var testStmtData []serverpb.StatementsResponse_CollectedStatementStatistics
-	var testTxnData []serverpb.StatementsResponse_ExtendedCollectedTransactionStatistics
 	expectedCountStats := 50
-	for i := 0; i < expectedCountStats; i++ {
-		var stats serverpb.StatementsResponse_CollectedStatementStatistics
-		randomData := sqlstatstestutil.GetRandomizedCollectedStatementStatisticsForTest(t)
-		stats.Key.KeyData = randomData.Key
-		testStmtData = append(testStmtData, stats)
-
-		var txnStats serverpb.StatementsResponse_ExtendedCollectedTransactionStatistics
-		txnStats.StatsData = sqlstatstestutil.GetRandomizedCollectedTransactionStatisticsForTest(t)
-		txnStats.StatsData.TransactionFingerprintID = appstatspb.TransactionFingerprintID(i)
-		testTxnData = append(testTxnData, txnStats)
-	}
-
-	st := cluster.MakeTestingClusterSettings()
-	monitor := mon.NewUnlimitedMonitor(context.Background(), mon.Options{
-		Name:     mon.MakeMonitorName("test"),
-		Settings: st,
-	})
-	insightsProvider := insights.New(st, insights.NewMetrics(), nil)
-
-	sqlStats := sslocal.New(
-		st,
-		sqlstats.MaxMemSQLStatsStmtFingerprints,
-		sqlstats.MaxMemSQLStatsTxnFingerprints,
-		nil, /* curMemoryBytesCount */
-		nil, /* maxMemoryBytesHist */
-		monitor,
-		nil, /* reportingSink */
-		nil, /* knobs */
-		insightsProvider.Anomalies(),
-	)
-
-	stmtContainer, _, _ := ssmemstorage.NewTempContainerFromExistingStmtStats(testStmtData)
-	err := sqlStats.AddAppStats(context.Background(), "app", stmtContainer)
-	require.NoError(t, err)
-
-	txnContainer, _, _ := ssmemstorage.NewTempContainerFromExistingTxnStats(testTxnData)
-	err = sqlStats.AddAppStats(context.Background(), "app", txnContainer)
-	require.NoError(t, err)
-
-	// Validate that ConsumeStats calls functions for every stmt and txn stats respectively.
-	consumedStmtsCount := 0
-	consumedTxnCount := 0
-	sqlStats.ConsumeStats(
-		context.Background(),
-		stopper,
-		func(ctx context.Context, statistics *appstatspb.CollectedStatementStatistics) error {
-			consumedStmtsCount++
-			return nil
-		},
-		func(ctx context.Context, statistics *appstatspb.CollectedTransactionStatistics) error {
-			consumedTxnCount++
-			return nil
-		},
-	)
-	require.Equal(t, expectedCountStats, consumedStmtsCount)
-	require.Equal(t, expectedCountStats, consumedTxnCount)
+	sqlStats := createNewSqlStats()
+	populateSqlStats(t, sqlStats, expectedCountStats)
+	expectedTotalFPCount := sqlStats.GetTotalFingerprintCount()
+	stmtStats, txnStats, totalFPCount := sqlStats.DrainStats(context.Background())
+	require.Equal(t, expectedTotalFPCount, totalFPCount)
+	require.Equal(t, expectedCountStats, len(stmtStats))
+	require.Equal(t, expectedCountStats, len(txnStats))
 
 	// Assert that no stats left after ConsumeStats func is executed.
-	err = sqlStats.IterateStatementStats(context.Background(), sqlstats.IteratorOptions{}, func(ctx context.Context, _ *appstatspb.CollectedStatementStatistics) error {
+	err := sqlStats.IterateStatementStats(context.Background(), sqlstats.IteratorOptions{}, func(ctx context.Context, _ *appstatspb.CollectedStatementStatistics) error {
 		require.Fail(t, "no stats should be available after calling ConsumeStats func")
 		return nil
 	})
@@ -1764,7 +1717,7 @@ func TestSQLStats_ConsumeStats(t *testing.T) {
 }
 
 // TestSQLStatsInternalStatements verifies SQL stats are captured
-// for internal statements.
+// for internal statementsBySessionID.
 func TestSQLStatsInternalStatements(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -1775,7 +1728,7 @@ func TestSQLStatsInternalStatements(t *testing.T) {
 			SQLExecutor: &sql.ExecutorTestingKnobs{
 				// Disable to make the test deterministic.
 				// We'll be checking to ensure that the internal
-				// statements are only sampled once.
+				// statementsBySessionID are only sampled once.
 				DisableProbabilisticSampling: true,
 			},
 		},
@@ -1971,7 +1924,7 @@ func TestSQLStatsDiscardStatsOnFingerprintLimit(t *testing.T) {
 
 	tests := []testCase{
 		{
-			name:      "statements in transactions are counted towards the limit",
+			name:      "statementsBySessionID in transactions are counted towards the limit",
 			stmtLimit: 4,
 			stmts: []testExecs{
 				{0, "BEGIN; SELECT 1; SELECT 1, 2; SELECT 1, 2, 3; COMMIT;"},
@@ -2013,7 +1966,7 @@ func TestSQLStatsDiscardStatsOnFingerprintLimit(t *testing.T) {
 				{1, "SELECT 1; SELECT 2"},
 				{2, "SELECT 1; SELECT 2"},
 			},
-			// There should be 3 statements per connection since
+			// There should be 3 statementsBySessionID per connection since
 			// stmt stats are not limited.
 			totalSkipped: 5,
 			minStmts:     6,
@@ -2045,14 +1998,14 @@ func TestSQLStatsDiscardStatsOnFingerprintLimit(t *testing.T) {
 			}
 			resetMetricsForTest()
 
-			// Execute the statements assigned to each connection.
+			// Execute the statementsBySessionID assigned to each connection.
 			for _, exec := range tc.stmts {
 				conns[exec.connIdx].Exec(t, exec.stmt)
 			}
 
 			// Verify that the expected stats are present, and we've skipped a minimum
 			// number of stats the test expects. We use this as a minimum since internal
-			// statements may be executed in the background.
+			// statementsBySessionID may be executed in the background.
 			if tc.stmtLimit == 0 {
 				require.GreaterOrEqual(t, countStmts(), tc.minStmts)
 			} else {
@@ -2068,4 +2021,72 @@ func TestSQLStatsDiscardStatsOnFingerprintLimit(t *testing.T) {
 		utilConn.Exec(t, "RESET CLUSTER SETTING sql.metrics.max_mem_stmt_fingerprints")
 		utilConn.Exec(t, "RESET CLUSTER SETTING sql.metrics.max_mem_txn_fingerprints")
 	}
+}
+
+func BenchmarkSqlStatsDrain(b *testing.B) {
+	defer leaktest.AfterTest(b)()
+	defer log.Scope(b).Close(b)
+
+	ctx := context.Background()
+	benchCase := []struct {
+		statsCount int
+	}{{10}, {50}, {100}, {1000}, {10000}, {50000}}
+	for _, bc := range benchCase {
+		b.Run(fmt.Sprintf("drainsql-%d", bc.statsCount), func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				sqlStats := createNewSqlStats()
+				populateSqlStats(b, sqlStats, bc.statsCount)
+				b.ResetTimer()
+				sqlStats.DrainStats(ctx)
+			}
+
+		})
+	}
+}
+
+func createNewSqlStats() *sslocal.SQLStats {
+	st := cluster.MakeTestingClusterSettings()
+	monitor := mon.NewUnlimitedMonitor(context.Background(), mon.Options{
+		Name:     mon.MakeName("test"),
+		Settings: st,
+	})
+	sqlstats.MaxMemSQLStatsStmtFingerprints.Override(context.Background(), &st.SV, 100000)
+	sqlstats.MaxMemSQLStatsTxnFingerprints.Override(context.Background(), &st.SV, 100000)
+	sqlStats := sslocal.New(
+		st,
+		sqlstats.MaxMemSQLStatsStmtFingerprints,
+		sqlstats.MaxMemSQLStatsTxnFingerprints,
+		nil, /* curMemoryBytesCount */
+		nil, /* maxMemoryBytesHist */
+		monitor,
+		nil, /* reportingSink */
+		nil, /* knobs */
+	)
+
+	return sqlStats
+}
+
+func populateSqlStats(t testing.TB, sqlStats *sslocal.SQLStats, expectedCountStats int) {
+	var testStmtData []serverpb.StatementsResponse_CollectedStatementStatistics
+	var testTxnData []serverpb.StatementsResponse_ExtendedCollectedTransactionStatistics
+	for i := 0; i < expectedCountStats; i++ {
+		var stats serverpb.StatementsResponse_CollectedStatementStatistics
+		randomData := sqlstatstestutil.GetRandomizedCollectedStatementStatisticsForTest(t)
+		stats.ID = appstatspb.StmtFingerprintID(i)
+		stats.Key.KeyData = randomData.Key
+		testStmtData = append(testStmtData, stats)
+
+		var txnStats serverpb.StatementsResponse_ExtendedCollectedTransactionStatistics
+		txnStats.StatsData = sqlstatstestutil.GetRandomizedCollectedTransactionStatisticsForTest(t)
+		txnStats.StatsData.TransactionFingerprintID = appstatspb.TransactionFingerprintID(i)
+		testTxnData = append(testTxnData, txnStats)
+	}
+
+	stmtContainer, _, _ := ssmemstorage.NewTempContainerFromExistingStmtStats(testStmtData)
+	err := sqlStats.AddAppStats(context.Background(), "app", stmtContainer)
+	require.NoError(t, err)
+
+	txnContainer, _, _ := ssmemstorage.NewTempContainerFromExistingTxnStats(testTxnData)
+	err = sqlStats.AddAppStats(context.Background(), "app", txnContainer)
+	require.NoError(t, err)
 }

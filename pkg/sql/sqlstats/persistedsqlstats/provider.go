@@ -20,9 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
-	"github.com/cockroachdb/cockroach/pkg/sql/parser"
-	"github.com/cockroachdb/cockroach/pkg/sql/parser/statements"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats/sslocal"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -32,6 +30,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
+	"github.com/cockroachdb/redact"
 )
 
 // Config is a configuration struct for the persisted SQL stats subsystem.
@@ -42,6 +41,7 @@ type Config struct {
 	ClusterID               func() uuid.UUID
 	SQLIDContainer          *base.SQLIDContainer
 	JobRegistry             *jobs.Registry
+	FanoutServer            serverpb.SQLStatusServer
 
 	// Metrics.
 	FlushesSuccessful       *metric.Counter
@@ -83,9 +83,6 @@ type PersistedSQLStats struct {
 
 	// The last time the size was checked before doing a flush.
 	lastSizeCheck time.Time
-
-	upsertTxnStatsStmt  statements.Statement[tree.Statement]
-	upsertStmtStatsStmt statements.Statement[tree.Statement]
 }
 
 // New returns a new instance of the PersistedSQLStats.
@@ -106,34 +103,6 @@ func New(cfg *Config, memSQLStats *sslocal.SQLStats) *PersistedSQLStats {
 	if cfg.Knobs != nil {
 		p.jobMonitor.testingKnobs.updateCheckInterval = cfg.Knobs.JobMonitorUpdateCheckInterval
 	}
-
-	upsertTxnStatsStmt, err := parser.ParseOne(`
-INSERT INTO system.transaction_statistics as t
-VALUES ($1, $2, $3, $4, $5, $6, $7)
-ON CONFLICT (crdb_internal_aggregated_ts_app_name_fingerprint_id_node_id_shard_8, aggregated_ts, fingerprint_id, app_name, node_id)
-DO UPDATE
-SET
-  statistics = crdb_internal.merge_transaction_stats(ARRAY(t.statistics, EXCLUDED.statistics))
-`)
-	if err != nil {
-		panic(err)
-	}
-	p.upsertTxnStatsStmt = upsertTxnStatsStmt
-
-	upsertStmtStatsStmt, err := parser.ParseOne(`
-INSERT INTO system.statement_statistics as s
-VALUES ($1 ,$2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-ON CONFLICT (crdb_internal_aggregated_ts_app_name_fingerprint_id_node_id_plan_hash_transaction_fingerprint_id_shard_8,
-             aggregated_ts, fingerprint_id, transaction_fingerprint_id, app_name, plan_hash, node_id)
-DO UPDATE
-SET
-  statistics = crdb_internal.merge_statement_stats(ARRAY(s.statistics, EXCLUDED.statistics)),
-  index_recommendations = EXCLUDED.index_recommendations
-`)
-	if err != nil {
-		panic(err)
-	}
-	p.upsertStmtStatsStmt = upsertStmtStatsStmt
 
 	return p
 }
@@ -166,11 +135,6 @@ func (s *PersistedSQLStats) SetFlushDoneSignalCh(sigCh chan<- struct{}) {
 	s.flushDoneMu.Lock()
 	defer s.flushDoneMu.Unlock()
 	s.flushDoneMu.signalCh = sigCh
-}
-
-// GetController returns the controller of the PersistedSQLStats.
-func (s *PersistedSQLStats) GetController(server serverpb.SQLStatusServer) *Controller {
-	return NewController(s, server, s.cfg.DB)
 }
 
 func (s *PersistedSQLStats) startSQLStatsFlushLoop(ctx context.Context, stopper *stop.Stopper) {
@@ -246,12 +210,6 @@ func (s *PersistedSQLStats) startSQLStatsFlushLoop(ctx context.Context, stopper 
 	}
 }
 
-// GetLocalMemProvider returns a SQLStats that can only be used to
-// access local in-memory sql statistics.
-func (s *PersistedSQLStats) GetLocalMemProvider() *sslocal.SQLStats {
-	return s.SQLStats
-}
-
 // GetNextFlushAt returns the time next flush is going to happen.
 func (s *PersistedSQLStats) GetNextFlushAt() time.Time {
 	return s.atomic.nextFlushAt.Load().(time.Time)
@@ -291,4 +249,55 @@ func (s *PersistedSQLStats) jitterInterval(interval time.Duration) time.Duration
 
 	jitteredInterval := time.Duration(frac * float64(interval.Nanoseconds()))
 	return jitteredInterval
+}
+
+// CreateSQLStatsCompactionSchedule implements the tree.SQLStatsController
+// interface.
+func (s *PersistedSQLStats) CreateSQLStatsCompactionSchedule(ctx context.Context) error {
+	return s.cfg.DB.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
+		_, err := CreateSQLStatsCompactionScheduleIfNotYetExist(ctx, txn, s.cfg.Settings, s.cfg.ClusterID())
+		return err
+	})
+}
+
+func (s *PersistedSQLStats) ResetClusterSQLStats(ctx context.Context) error {
+	// Reset the in-memory stats on all nodes.
+	req := &serverpb.ResetSQLStatsRequest{}
+	if _, err := s.cfg.FanoutServer.ResetSQLStats(ctx, req); err != nil {
+		// Failure to flush in-memory stats is not fatal. We should still
+		// try to reset the persisted stats.
+		log.Warningf(ctx, "error resetting in-memory sql stats: %s", err)
+	}
+
+	// Reset persisted stats by truncating tables.
+	if err := s.resetSysTableStats(ctx, "system.statement_statistics"); err != nil {
+		return err
+	}
+
+	if err := s.resetSysTableStats(ctx, "system.transaction_statistics"); err != nil {
+		return err
+	}
+
+	return s.ResetActivityTables(ctx)
+}
+
+// ResetActivityTables implements the tree.SQLStatsController interface. This
+// method resets the {statement|transaction}_activity system tables.
+func (s *PersistedSQLStats) ResetActivityTables(ctx context.Context) error {
+	if err := s.resetSysTableStats(ctx, "system.statement_activity"); err != nil {
+		return err
+	}
+
+	return s.resetSysTableStats(ctx, "system.transaction_activity")
+}
+
+func (s *PersistedSQLStats) resetSysTableStats(ctx context.Context, tableName string) (err error) {
+	ex := s.cfg.DB.Executor()
+	_, err = ex.ExecEx(
+		ctx,
+		redact.Sprintf("reset-%s", tableName),
+		nil, /* txn */
+		sessiondata.NodeUserSessionDataOverride,
+		"TRUNCATE "+tableName)
+	return err
 }

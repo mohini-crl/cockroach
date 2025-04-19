@@ -468,6 +468,7 @@ ElementState:
     tableId: 105
     temporaryIndexId: 0
     type: FORWARD
+    vecConfig: null
   Status: PUBLIC
 - SchemaChild:
     childObjectId: 105
@@ -490,6 +491,9 @@ ElementState:
     databaseId: 100
     tableId: 105
   Status: PUBLIC
+- TableSchemaLocked:
+    tableId: 105
+  Status: PUBLIC
 - UserPrivileges:
     descriptorId: 105
     privileges: "2"
@@ -504,8 +508,10 @@ ElementState:
   Status: PUBLIC
 
 setup
+ALTER TABLE tbl SET (schema_locked=false);
 ALTER TABLE tbl ALTER COLUMN cexpr DROP DEFAULT;
 ALTER TABLE tbl ALTER COLUMN cexpr DROP ON UPDATE;
+ALTER TABLE tbl SET (schema_locked=true);
 DROP SEQUENCE otherseq CASCADE;
 ----
 
@@ -859,6 +865,7 @@ ElementState:
     tableId: 105
     temporaryIndexId: 0
     type: FORWARD
+    vecConfig: null
   Status: PUBLIC
 - SchemaChild:
     childObjectId: 105
@@ -874,6 +881,9 @@ ElementState:
   Status: PUBLIC
 - TableData:
     databaseId: 100
+    tableId: 105
+  Status: PUBLIC
+- TableSchemaLocked:
     tableId: 105
   Status: PUBLIC
 - UserPrivileges:

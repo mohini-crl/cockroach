@@ -34,7 +34,7 @@ import (
 )
 
 func init() {
-	if numOperators != 63 {
+	if numOperators != 65 {
 		// This error occurs when an operator has been added or removed in
 		// pkg/sql/opt/exec/explain/factory.opt. If an operator is added at the
 		// end of factory.opt, simply adjust the hardcoded value above. If an
@@ -309,10 +309,12 @@ func (d *planGistDecoder) decodeID() cat.StableID {
 }
 
 func (d *planGistDecoder) decodeTable() cat.Table {
+	// We need to consume the ID even if we don't have the catalog to actually
+	// decode the table.
+	id := d.decodeID()
 	if d.catalog == nil {
 		return &unknownTable{}
 	}
-	id := d.decodeID()
 	// TODO(mgartner): Do not use the background context.
 	ds, _, err := d.catalog.ResolveDataSourceByID(context.Background(), cat.Flags{}, id)
 	if err == nil {
@@ -498,6 +500,10 @@ func (u *unknownTable) ID() cat.StableID {
 	panic(errors.AssertionFailedf("not implemented"))
 }
 
+func (u *unknownTable) Version() uint64 {
+	panic(errors.AssertionFailedf("not implemented"))
+}
+
 func (u *unknownTable) PostgresDescriptorID() catid.DescID {
 	panic(errors.AssertionFailedf("not implemented"))
 }
@@ -524,6 +530,10 @@ func (u *unknownTable) IsSystemTable() bool {
 
 func (u *unknownTable) IsMaterializedView() bool {
 	return false
+}
+
+func (u *unknownTable) LookupColumnOrdinal(descpb.ColumnID) (int, error) {
+	panic(errors.AssertionFailedf("not implemented"))
 }
 
 func (u *unknownTable) ColumnCount() int {
@@ -640,6 +650,11 @@ func (u *unknownTable) GetDatabaseID() descpb.ID {
 	return 0
 }
 
+// GetSchemaID is part of the cat.Table interface.
+func (u *unknownTable) GetSchemaID() descpb.ID {
+	return 0
+}
+
 // IsHypothetical is part of the cat.Table interface.
 func (u *unknownTable) IsHypothetical() bool {
 	return false
@@ -658,13 +673,11 @@ func (u *unknownTable) Trigger(i int) cat.Trigger {
 // IsRowLevelSecurityEnabled is part of the cat.Table interface
 func (u *unknownTable) IsRowLevelSecurityEnabled() bool { return false }
 
-// PolicyCount is part of the cat.Table interface
-func (u *unknownTable) PolicyCount(polType tree.PolicyType) int { return 0 }
+// IsRowLevelSecurityForced is part of the cat.Table interface
+func (u *unknownTable) IsRowLevelSecurityForced() bool { return false }
 
-// Policy is part of the cat.Table interface
-func (u *unknownTable) Policy(polType tree.PolicyType, i int) cat.Policy {
-	panic(errors.AssertionFailedf("not implemented"))
-}
+// Policies is part of the cat.Table interface.
+func (u *unknownTable) Policies() *cat.Policies { return nil }
 
 var _ cat.Table = &unknownTable{}
 
@@ -785,6 +798,10 @@ func (u *unknownIndex) PartitionCount() int {
 
 func (u *unknownIndex) Partition(i int) cat.Partition {
 	panic(errors.AssertionFailedf("not implemented"))
+}
+
+func (u *unknownIndex) IsTemporaryIndexForBackfill() bool {
+	return false
 }
 
 var _ cat.Index = &unknownIndex{}

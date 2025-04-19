@@ -102,14 +102,6 @@ func createLogicalReplicationStreamPlanHook(
 			return err
 		}
 
-		// TODO(dt): the global priv is a big hammer; should we be checking just on
-		// table(s) or database being replicated from and into?
-		if err := p.CheckPrivilege(
-			ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.REPLICATION,
-		); err != nil {
-			return err
-		}
-
 		if stmt.From.Database != "" {
 			return errors.UnimplementedErrorf(errors.IssueLink{}, "logical replication streams on databases are unsupported")
 		}
@@ -156,6 +148,10 @@ func createLogicalReplicationStreamPlanHook(
 		resolvedDestObjects, err := resolveDestinationObjects(ctx, p, p.SessionData(), stmt.Into, stmt.CreateTable)
 		if err != nil {
 			return err
+		}
+
+		if err := checkReplicationPrivileges(ctx, p, stmt, resolvedDestObjects, options.BidirectionalURI()); err != nil {
+			return errors.Wrapf(err, "failed privilege check: table or system level REPLICATIONDEST privilege required")
 		}
 
 		if !p.ExtendedEvalContext().TxnIsSingleStmt {
@@ -327,10 +323,11 @@ func createLogicalReplicationStreamPlanHook(
 				ReverseStreamCommand:      reverseStreamCmd,
 				ParentID:                  int64(options.ParentID),
 				Command:                   stmt.String(),
+				SkipSchemaCheck:           options.SkipSchemaCheck(),
 			},
 			Progress: progress,
 		}
-		if err := doLDRPlan(ctx, p.User(), p.ExecCfg(), jr, spec.ExternalCatalog, resolvedDestObjects, options.SkipSchemaCheck()); err != nil {
+		if err := doLDRPlan(ctx, p.User(), p.ExecCfg(), jr, spec.ExternalCatalog, resolvedDestObjects); err != nil {
 			return err
 		}
 		resultsCh <- tree.Datums{tree.NewDInt(tree.DInt(jr.JobID))}
@@ -359,6 +356,14 @@ func (r *ResolvedDestObjects) TargetDescription() string {
 		}
 	}
 	return targetDescription
+}
+
+func (r *ResolvedDestObjects) TargetTableNames() []string {
+	var targetTableNames []string
+	for i := range r.TableNames {
+		targetTableNames = append(targetTableNames, r.TableNames[i].Table())
+	}
+	return targetTableNames
 }
 
 func resolveDestinationObjects(
@@ -426,7 +431,6 @@ func doLDRPlan(
 	jr jobs.Record,
 	srcExternalCatalog externalpb.ExternalCatalog,
 	resolvedDestObjects ResolvedDestObjects,
-	skipSchemaCheck bool,
 ) error {
 	details := jr.Details.(jobspb.LogicalReplicationDetails)
 	return execCfg.InternalDB.DescsTxn(ctx, func(ctx context.Context, txn descs.Txn) error {
@@ -435,7 +439,11 @@ func doLDRPlan(
 			ingestedCatalog externalpb.ExternalCatalog
 		)
 		if details.CreateTable {
-			ingestedCatalog, err = externalcatalog.IngestExternalCatalog(ctx, execCfg, user, srcExternalCatalog, txn, txn.Descriptors(), resolvedDestObjects.ParentDatabaseID, resolvedDestObjects.ParentSchemaID, true /* setOffline */)
+			ingestingTableNames := make([]string, len(resolvedDestObjects.TableNames))
+			for i := range resolvedDestObjects.TableNames {
+				ingestingTableNames[i] = resolvedDestObjects.TableNames[i].Table()
+			}
+			ingestedCatalog, err = externalcatalog.IngestExternalCatalog(ctx, execCfg, user, srcExternalCatalog, txn, txn.Descriptors(), resolvedDestObjects.ParentDatabaseID, resolvedDestObjects.ParentSchemaID, true /* setOffline */, ingestingTableNames)
 			if err != nil {
 				return err
 			}
@@ -467,6 +475,12 @@ func doLDRPlan(
 				return errors.AssertionFailedf("srcTableDescs and dstTableDescs should have the same length")
 			}
 		}
+
+		writer, err := getWriterType(ctx, details.Mode, execCfg.Settings)
+		if err != nil {
+			return err
+		}
+
 		for i := range srcExternalCatalog.Tables {
 			destTableDesc := dstTableDescs[i]
 			if details.Mode != jobspb.LogicalReplicationDetails_Validated {
@@ -475,7 +489,7 @@ func doLDRPlan(
 				}
 			}
 
-			err := tabledesc.CheckLogicalReplicationCompatibility(&srcExternalCatalog.Tables[i], destTableDesc.TableDesc(), skipSchemaCheck || details.CreateTable)
+			err := tabledesc.CheckLogicalReplicationCompatibility(&srcExternalCatalog.Tables[i], destTableDesc.TableDesc(), details.SkipSchemaCheck || details.CreateTable, writer == writerTypeLegacyKV)
 			if err != nil {
 				return err
 			}
@@ -662,6 +676,9 @@ func lookupFunctionID(
 	if len(rf.Overloads) > 1 {
 		return 0, errors.Newf("function %q has more than 1 overload", u.String())
 	}
+	if rf.UnsupportedWithIssue != 0 {
+		return 0, rf.MakeUnsupportedError()
+	}
 	fnOID := rf.Overloads[0].Oid
 	descID := typedesc.UserDefinedTypeOIDToID(fnOID)
 	if descID == 0 {
@@ -720,4 +737,37 @@ func (r *resolvedLogicalReplicationOptions) BidirectionalURI() string {
 		return ""
 	}
 	return r.bidirectionalURI
+}
+
+func checkReplicationPrivileges(
+	ctx context.Context,
+	p sql.PlanHookState,
+	stmt *tree.CreateLogicalReplicationStream,
+	resolvedDestObjects ResolvedDestObjects,
+	bidirectionalStream string,
+) error {
+	if err := p.CheckPrivilege(
+		ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.REPLICATIONDEST,
+	); err != nil {
+		if !stmt.CreateTable {
+			return replicationutils.AuthorizeTableLevelPriv(ctx, p, p.ExtendedEvalContext().SessionAccessor, privilege.REPLICATIONDEST, resolvedDestObjects.TargetTableNames())
+		} else {
+			dbDesc, err := p.InternalSQLTxn().Descriptors().ByIDWithLeased(p.InternalSQLTxn().KV()).WithoutNonPublic().Get().Database(ctx, resolvedDestObjects.ParentDatabaseID)
+			if err != nil {
+				return err
+			}
+			if err := p.CheckPrivilege(ctx, dbDesc, privilege.CREATE); err != nil {
+				return err
+			}
+			if bidirectionalStream != "" {
+				// TODO(msbutler): how to validate that the user in the reverse stream
+				// URI has REPLICATIONSOURCE priv on a table that has yet to be created?
+				// We could assert it is the same user as the current user, then we
+				// could grant the user the REPLICATIONSOURCE priv on table creation?
+				// Or, we could make REPLICATIONSOURCE a db level priv, required for
+				// BIDI??
+			}
+		}
+	}
+	return nil
 }

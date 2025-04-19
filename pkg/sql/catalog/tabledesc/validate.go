@@ -276,6 +276,22 @@ func (desc *wrapper) ValidateForwardReferences(
 func (desc *wrapper) ValidateBackReferences(
 	vea catalog.ValidationErrorAccumulator, vdg catalog.ValidationDescGetter,
 ) {
+	// Check that all expression strings can be parsed.
+	// NOTE: This could be performed in ValidateSelf, but we want to avoid that
+	// since parsing all the expressions is a relatively expensive thing to do.
+	_ = ForEachExprStringInTableDesc(desc, func(expr *string, typ catalog.DescExprType) (err error) {
+		switch typ {
+		case catalog.SQLExpr:
+			_, err = parser.ParseExpr(*expr)
+		case catalog.SQLStmt:
+			_, err = parser.Parse(*expr)
+		case catalog.PLpgSQLStmt:
+			_, err = plpgsqlparser.Parse(*expr)
+		}
+		vea.Report(err)
+		return nil
+	})
+
 	// Check that outbound foreign keys have matching back-references.
 	for i := range desc.OutboundFKs {
 		vea.Report(desc.validateOutboundFKBackReference(&desc.OutboundFKs[i], vdg))
@@ -1048,20 +1064,6 @@ func (desc *wrapper) ValidateSelf(vea catalog.ValidationErrorAccumulator) {
 			dscs.JobID, desc.MutationJobs))
 	}
 
-	// Check that all expression strings can be parsed.
-	_ = ForEachExprStringInTableDesc(desc, func(expr *string, typ catalog.DescExprType) (err error) {
-		switch typ {
-		case catalog.SQLExpr:
-			_, err = parser.ParseExpr(*expr)
-		case catalog.SQLStmt:
-			_, err = parser.Parse(*expr)
-		case catalog.PLpgSQLStmt:
-			_, err = plpgsqlparser.Parse(*expr)
-		}
-		vea.Report(err)
-		return nil
-	})
-
 	vea.Report(ValidateRowLevelTTL(desc.GetRowLevelTTL()))
 	// The remaining validation is called separately from ValidateRowLevelTTL
 	// because it can only be called on an initialized table descriptor.
@@ -1789,13 +1791,10 @@ func (desc *wrapper) validateTableIndexes(
 			}
 
 			// When newPKColIDs is not empty, it means there is an in-progress `ALTER
-			// PRIMARY KEY`. We don't allow queueing schema changes when there's a
-			// primary key mutation, so it's safe to make the assumption that `Adding`
-			// indexes are associated with the new primary key because they are
-			// rewritten and `Non-adding` indexes should only contain virtual column
-			// from old primary key.
+			// PRIMARY KEY`. Certain schema changes will make the new virtual columns
+			// public earlier than the new primary key, which should be acceptable.
 			isOldPKCol := !idx.Adding() && curPKColIDs.Contains(colID)
-			isNewPKCol := idx.Adding() && newPKColIDs.Contains(colID)
+			isNewPKCol := newPKColIDs.Contains(colID)
 			if newPKColIDs.Len() > 0 && (isOldPKCol || isNewPKCol) {
 				continue
 			}
@@ -2236,6 +2235,7 @@ func (desc *wrapper) validateAutoStatsSettings(vea catalog.ValidationErrorAccumu
 	}
 	desc.validateAutoStatsEnabled(vea, catpb.AutoStatsEnabledTableSettingName, desc.AutoStatsSettings.Enabled)
 	desc.validateAutoStatsEnabled(vea, catpb.AutoPartialStatsEnabledTableSettingName, desc.AutoStatsSettings.PartialEnabled)
+	desc.validateAutoStatsEnabled(vea, catpb.AutoFullStatsEnabledTableSettingName, desc.AutoStatsSettings.FullEnabled)
 
 	desc.validateMinStaleRows(vea, catpb.AutoStatsMinStaleTableSettingName, desc.AutoStatsSettings.MinStaleRows)
 	desc.validateMinStaleRows(vea, catpb.AutoPartialStatsMinStaleTableSettingName, desc.AutoStatsSettings.PartialMinStaleRows)

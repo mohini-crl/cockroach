@@ -58,6 +58,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/storageparam/tablestorageparam"
 	"github.com/cockroachdb/cockroach/pkg/sql/ttl/ttlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/sql/vecindex"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
@@ -367,12 +368,14 @@ func (n *createTableNode) startExec(params runParams) error {
 
 	var desc *tabledesc.Mutable
 	var affected map[descpb.ID]*tabledesc.Mutable
-	// creationTime is initialized to a zero value and populated at read time.
-	// See the comment in desc.MaybeIncrementVersion.
-	//
-	// TODO(ajwerner): remove the timestamp from newTableDesc and its friends,
-	// it's	currently relied on in import and restore code and tests.
+	// creationTime is usually initialized to a zero value and populated at read
+	// time. See the comment in desc.MaybeIncrementVersion. However, for CREATE
+	// TABLE AS ... AS OF SYSTEM TIME, we need to set the creation time to the
+	// specified timestamp.
 	var creationTime hlc.Timestamp
+	if asOf := params.p.extendedEvalCtx.AsOfSystemTime; asOf != nil && asOf.ForBackfill {
+		creationTime = asOf.Timestamp
+	}
 	privs, err := catprivilege.CreatePrivilegesFromDefaultPrivileges(
 		n.dbDesc.GetDefaultPrivilegeDescriptor(),
 		schema.GetDefaultPrivilegeDescriptor(),
@@ -518,7 +521,7 @@ func (n *createTableNode) startExec(params runParams) error {
 			if err != nil {
 				return errors.Wrap(err, "error resolving multi-region enum")
 			}
-			typeDesc.AddReferencingDescriptorID(desc.ID)
+			_ = typeDesc.AddReferencingDescriptorID(desc.ID)
 			err = params.p.writeTypeSchemaChange(
 				params.ctx, typeDesc, "add REGIONAL BY TABLE back reference")
 			if err != nil {
@@ -552,18 +555,14 @@ func (n *createTableNode) startExec(params runParams) error {
 
 			// Instantiate a row inserter and table writer. It has a 1-1
 			// mapping to the definitions in the descriptor.
-			internal := params.p.SessionData().Internal
 			ri, err := row.MakeInserter(
-				params.ctx,
-				params.p.txn,
 				params.ExecCfg().Codec,
 				desc.ImmutableCopy().(catalog.TableDescriptor),
 				nil, /* uniqueWithTombstoneIndexes */
 				desc.PublicColumns(),
-				&tree.DatumAlloc{},
+				params.p.SessionData(),
 				&params.ExecCfg().Settings.SV,
-				internal,
-				params.ExecCfg().GetRowMetrics(internal),
+				params.ExecCfg().GetRowMetrics(params.p.SessionData().Internal),
 			)
 			if err != nil {
 				return err
@@ -610,11 +609,12 @@ func (n *createTableNode) startExec(params runParams) error {
 				// Populate the buffer.
 				copy(rowBuffer, n.input.Values())
 
-				// CREATE TABLE AS does not copy indexes from the input table.
-				// An empty row.PartialIndexUpdateHelper is used here because
-				// there are no indexes, partial or otherwise, to update.
+				// CREATE TABLE AS does not copy indexes from the input table. Empty
+				// partial and vector index helpers are used here because there are no
+				// indexes, partial, vector, or otherwise, to update.
 				var pm row.PartialIndexUpdateHelper
-				if err := ti.row(params.ctx, rowBuffer, pm, params.extendedEvalCtx.Tracing.KVTracingEnabled()); err != nil {
+				var vh row.VectorIndexUpdateHelper
+				if err := ti.row(params.ctx, rowBuffer, pm, vh, params.extendedEvalCtx.Tracing.KVTracingEnabled()); err != nil {
 					return err
 				}
 			}
@@ -650,6 +650,14 @@ func (n *createTableNode) Input(i int) (planNode, error) {
 		return n.input, nil
 	}
 	return nil, errors.AssertionFailedf("input index %d is out of range", i)
+}
+
+func (n *createTableNode) SetInput(i int, p planNode) error {
+	if i == 0 && n.n.As() {
+		n.input = p
+		return nil
+	}
+	return errors.AssertionFailedf("input index %d is out of range", i)
 }
 
 func qualifyFKColErrorWithDB(
@@ -1423,6 +1431,14 @@ func NewTableDesc(
 	); err != nil {
 		return nil, err
 	}
+
+	paramIsDelete := n.StorageParams.GetVal("ttl_delete_rate_limit") != nil
+	paramIsSelect := n.StorageParams.GetVal("ttl_select_rate_limit") != nil
+
+	if paramIsDelete || paramIsSelect {
+		printTTLRateLimitNotice(ctx, evalCtx.ClientNoticeSender)
+	}
+
 	setter.TableDesc.RowLevelTTL = setter.UpdatedRowLevelTTL
 
 	indexEncodingVersion := descpb.StrictIndexColumnIDGuaranteesVersion
@@ -1887,9 +1903,6 @@ func NewTableDesc(
 			// pass, handled above.
 
 		case *tree.IndexTableDef:
-			if d.Type == idxtype.VECTOR {
-				return nil, unimplemented.NewWithIssuef(137370, "VECTOR indexes are not yet supported")
-			}
 			// If the index is named, ensure that the name is unique. Unnamed
 			// indexes will be given a unique auto-generated name later on when
 			// AllocateIDs is called.
@@ -1905,6 +1918,7 @@ func NewTableDesc(
 			// virtual columns. If the txn ends up retrying, then this change is not
 			// syntactically valid, since the virtual column is only added in the descriptor
 			// and not in the AST.
+			//nolint:deferloop
 			defer copyIndexElemListAndRestore(&d.Columns)()
 			if err := replaceExpressionElemsWithVirtualCols(
 				ctx,
@@ -1949,6 +1963,18 @@ func NewTableDesc(
 					ctx, evalCtx.Settings, column, &idx, columns[len(columns)-1]); err != nil {
 					return nil, err
 				}
+			}
+			if d.Type == idxtype.VECTOR {
+				// Disable vector indexes by default in 25.2.
+				// TODO(andyk): Remove this check after 25.2.
+				if err := vecindex.CheckEnabled(&st.SV); err != nil {
+					return nil, err
+				}
+				column, err := catalog.MustFindColumnByName(&desc, idx.VectorColumnName())
+				if err != nil {
+					return nil, err
+				}
+				idx.VecConfig = vecindex.MakeVecConfig(evalCtx, column.GetType())
 			}
 
 			var idxPartitionBy *tree.PartitionBy
@@ -2023,6 +2049,7 @@ func NewTableDesc(
 			// virtual columns. If the txn ends up retrying, then this change is not
 			// syntactically valid, since the virtual descriptor is only added in the descriptor
 			// and not in the AST.
+			//nolint:deferloop
 			defer copyIndexElemListAndRestore(&d.Columns)()
 			if err := replaceExpressionElemsWithVirtualCols(
 				ctx,
@@ -2393,6 +2420,18 @@ func NewTableDesc(
 				telemetry.Inc(sqltelemetry.PartitionedInvertedIndexCounter)
 			}
 		}
+		if idx.GetType() == idxtype.VECTOR {
+			telemetry.Inc(sqltelemetry.VectorIndexCounter)
+			if idx.IsPartial() {
+				telemetry.Inc(sqltelemetry.PartialVectorIndexCounter)
+			}
+			if idx.NumKeyColumns() > 1 {
+				telemetry.Inc(sqltelemetry.MultiColumnVectorIndexCounter)
+			}
+			if idx.PartitioningColumnCount() != 0 {
+				telemetry.Inc(sqltelemetry.PartitionedVectorIndexCounter)
+			}
+		}
 		if idx.IsPartial() {
 			telemetry.Inc(sqltelemetry.PartialIndexCounter)
 		}
@@ -2533,6 +2572,17 @@ func newTableDesc(
 		}
 		ttl.ScheduleID = j.ScheduleID()
 	}
+
+	// For tables set schema_locked by default if it hasn't been set, and we
+	// aren't running under an internal executor.
+	if !ret.IsView() && !ret.IsSequence() &&
+		n.StorageParams.GetVal("schema_locked") == nil &&
+		!params.p.SessionData().Internal &&
+		params.p.SessionData().CreateTableWithSchemaLocked &&
+		params.p.IsActive(params.ctx, clusterversion.V25_2) {
+		ret.SchemaLocked = true
+	}
+
 	return ret, nil
 }
 
@@ -2809,8 +2859,8 @@ func replaceLikeTableOpts(n *tree.CreateTable, params runParams) (tree.TableDefs
 					indexDef.Columns = append(indexDef.Columns, elem)
 				}
 				// The last column of an inverted or vector index cannot have an
-				// explicit direction.
-				if !indexDef.Type.AllowExplicitDirection() {
+				// explicit direction, because it does not have a linear ordering.
+				if !indexDef.Type.HasLinearOrdering() {
 					indexDef.Columns[len(indexDef.Columns)-1].Direction = tree.DefaultDirection
 				}
 				for j := 0; j < idx.NumSecondaryStoredColumns(); j++ {

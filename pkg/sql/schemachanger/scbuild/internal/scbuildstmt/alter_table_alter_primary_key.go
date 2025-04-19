@@ -25,6 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/idxtype"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
@@ -58,6 +59,16 @@ type alterPrimaryKeySpec struct {
 func alterPrimaryKey(
 	b BuildCtx, tn *tree.TableName, tbl *scpb.Table, stmt tree.Statement, t alterPrimaryKeySpec,
 ) {
+	// Check if sql_safe_updates is enabled and the table has a vector index
+	if b.EvalCtx().SessionData().SafeUpdates {
+		tableElts := b.QueryByID(tbl.TableID).Filter(notFilter(absentTargetFilter))
+		scpb.ForEachSecondaryIndex(tableElts, func(_ scpb.Status, _ scpb.TargetStatus, idx *scpb.SecondaryIndex) {
+			if idx.Type == idxtype.VECTOR {
+				panic(pgerror.DangerousStatementf("ALTER PRIMARY KEY on a table with vector indexes will disable writes to the table while the index is being rebuilt"))
+			}
+		})
+	}
+
 	// Panic on certain forbidden `ALTER PRIMARY KEY` cases (e.g. one of
 	// the new primary key column is a virtual column). See the comments
 	// for a full list of preconditions we check.
@@ -348,12 +359,8 @@ func checkForEarlyExit(b BuildCtx, tbl *scpb.Table, t alterPrimaryKeySpec) {
 		columnType := mustRetrieveColumnTypeElem(b, tbl.TableID, colElem.ColumnID)
 		// Check if the column type is indexable.
 		if !colinfo.ColumnTypeIsIndexable(columnType.Type) {
-			panic(unimplemented.NewWithIssueDetailf(35730,
-				columnType.Type.DebugString(),
-				"column %s is of type %s and thus is not indexable",
-				col.Column,
-				columnType.Type),
-			)
+			panic(sqlerrors.NewColumnNotIndexableError(
+				col.Column.String(), columnType.Type.Name(), columnType.Type.DebugString()))
 		}
 	}
 }
@@ -450,12 +457,18 @@ func fallBackIfRegionalByRowTable(b BuildCtx, t tree.NodeFormatter, tableID cati
 	}
 }
 
+// mustRetrieveCurrentPrimaryIndexElement retrieves the current primary index,
+// which must be public.
 func mustRetrieveCurrentPrimaryIndexElement(
 	b BuildCtx, tableID catid.DescID,
 ) (res *scpb.PrimaryIndex) {
 	scpb.ForEachPrimaryIndex(b.QueryByID(tableID), func(
 		current scpb.Status, target scpb.TargetStatus, e *scpb.PrimaryIndex,
 	) {
+		// TODO(fqazi): We don't support DROP CONSTRAINT PRIMARY KEY, so there is no
+		// risk of ever seeing a non-public PrimaryIndex element. In the future when
+		// we do support DROP CONSTRAINT PRIMARY KEY, we should adapt callers of
+		// this function to handle the absent primary index case.
 		if current == scpb.Status_PUBLIC {
 			res = e
 		}
@@ -741,6 +754,7 @@ func recreateAllSecondaryIndexes(
 		}
 		in, temp := makeSwapIndexSpec(b, out, sourcePrimaryIndex.IndexID, inColumns, false /* inUseTempIDs */)
 		in.secondary.RecreateSourceIndexID = out.indexID()
+		in.secondary.RecreateTargetIndexID = newPrimaryIndex.IndexID
 		out.apply(b.Drop)
 		in.apply(b.Add)
 		temp.apply(b.AddTransient)

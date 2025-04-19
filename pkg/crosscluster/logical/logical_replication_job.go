@@ -34,12 +34,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/physicalplan"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/util/bulk"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/span"
+	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/redact"
@@ -75,6 +77,13 @@ var maxWait = time.Minute * 5
 
 type logicalReplicationResumer struct {
 	job *jobs.Job
+
+	mu struct {
+		syncutil.Mutex
+		// perNodeAggregatorStats is a per component running aggregate of trace
+		// driven AggregatorStats emitted by the processors.
+		perNodeAggregatorStats bulk.ComponentAggregatorStats
+	}
 }
 
 var _ jobs.Resumer = (*logicalReplicationResumer)(nil)
@@ -93,19 +102,19 @@ func (r *logicalReplicationResumer) handleResumeError(
 		return nil
 	}
 	if jobs.IsPermanentJobError(err) {
-		r.updateRunningStatus(ctx, redact.Sprintf("permanent error: %s", err.Error()))
+		r.updateStatusMessage(ctx, redact.Sprintf("permanent error: %s", err.Error()))
 		return err
 	}
-	r.updateRunningStatus(ctx, redact.Sprintf("pausing after error: %s", err.Error()))
+	r.updateStatusMessage(ctx, redact.Sprintf("pausing after error: %s", err.Error()))
 	return jobs.MarkPauseRequestError(err)
 }
 
-func (r *logicalReplicationResumer) updateRunningStatus(
-	ctx context.Context, runningStatus redact.RedactableString,
+func (r *logicalReplicationResumer) updateStatusMessage(
+	ctx context.Context, status redact.RedactableString,
 ) {
-	log.Infof(ctx, "%s", runningStatus)
+	log.Infof(ctx, "%s", status)
 	err := r.job.NoTxn().Update(ctx, func(txn isql.Txn, md jobs.JobMetadata, ju *jobs.JobUpdater) error {
-		md.Progress.RunningStatus = string(runningStatus.Redact())
+		md.Progress.StatusMessage = string(status.Redact())
 		ju.UpdateProgress(md.Progress)
 		return nil
 	})
@@ -114,7 +123,7 @@ func (r *logicalReplicationResumer) updateRunningStatus(
 	}
 }
 
-func (r logicalReplicationResumer) getClusterUris(
+func (r *logicalReplicationResumer) getClusterUris(
 	ctx context.Context, job *jobs.Job, db *sql.InternalDB,
 ) ([]streamclient.ClusterUri, error) {
 	var (
@@ -146,7 +155,6 @@ func (r *logicalReplicationResumer) ingest(
 	var (
 		execCfg        = jobExecCtx.ExecCfg()
 		distSQLPlanner = jobExecCtx.DistSQLPlanner()
-		evalCtx        = jobExecCtx.ExtendedEvalContext()
 
 		progress = r.job.Progress().Details.(*jobspb.Progress_LogicalReplication).LogicalReplication
 		payload  = r.job.Details().(jobspb.LogicalReplicationDetails)
@@ -280,6 +288,7 @@ func (r *logicalReplicationResumer) ingest(
 			job:                   r.job,
 			frontierUpdates:       heartbeatSender.FrontierUpdates,
 			rangeStats:            newRangeStatsCollector(planInfo.writeProcessorCount),
+			r:                     r,
 		}
 		rowResultWriter := sql.NewCallbackResultWriter(rh.handleRow)
 		distSQLReceiver := sql.MakeDistSQLReceiver(
@@ -289,18 +298,18 @@ func (r *logicalReplicationResumer) ingest(
 			execCfg.RangeDescriptorCache,
 			nil, /* txn */
 			nil, /* clockUpdater */
-			evalCtx.Tracing,
+			jobExecCtx.ExtendedEvalContext().Tracing,
 		)
 		defer distSQLReceiver.Release()
-		// Copy the evalCtx, as dsp.Run() might change it.
-		evalCtxCopy := *evalCtx
+		// Copy the eval.Context, as dsp.Run() might change it.
+		evalCtxCopy := jobExecCtx.ExtendedEvalContext().Context.Copy()
 		distSQLPlanner.Run(
 			ctx,
 			initialPlanCtx,
 			nil, /* txn */
 			initialPlan,
 			distSQLReceiver,
-			&evalCtxCopy,
+			evalCtxCopy,
 			nil, /* finishedSetupFn */
 		)
 
@@ -479,6 +488,7 @@ func (p *logicalReplicationPlanner) generatePlanImpl(
 		// During an offline initial scan, we need to replicate the whole table, not
 		// just the primary keys.
 		UseTableSpan: payload.CreateTable && progress.ReplicatedTime.IsEmpty(),
+		StreamID:     streampb.StreamID(payload.StreamID),
 	}
 	for _, pair := range payload.ReplicationPairs {
 		req.TableIDs = append(req.TableIDs, pair.SrcDescriptorID)
@@ -500,7 +510,10 @@ func (p *logicalReplicationPlanner) generatePlanImpl(
 	if defaultFnID := payload.DefaultConflictResolution.FunctionId; defaultFnID != 0 {
 		defaultFnOID = catid.FuncIDToOID(catid.DescID(defaultFnID))
 	}
-
+	writer, err := getWriterType(ctx, payload.Mode, execCfg.Settings)
+	if err != nil {
+		return nil, nil, info, err
+	}
 	crossClusterResolver := crosscluster.MakeCrossClusterTypeResolver(plan.SourceTypes)
 	tableMetadataByDestID := make(map[int32]execinfrapb.TableReplicationMetadata)
 	if err := sql.DescsTxn(ctx, execCfg, func(ctx context.Context, txn isql.Txn, descriptors *descs.Collection) error {
@@ -524,6 +537,10 @@ func (p *logicalReplicationPlanner) generatePlanImpl(
 			scDesc, err := descriptors.ByIDWithoutLeased(txn.KV()).WithoutNonPublic().Get().Schema(ctx, dstTableDesc.GetParentSchemaID())
 			if err != nil {
 				return errors.Wrapf(err, "failed to look up schema descriptor for table %d", pair.DstDescriptorID)
+			}
+
+			if err := tabledesc.CheckLogicalReplicationCompatibility(&srcTableDesc, dstTableDesc.TableDesc(), payload.SkipSchemaCheck || payload.CreateTable, writer == writerTypeLegacyKV); err != nil {
+				return err
 			}
 
 			var fnOID oid.Oid
@@ -574,11 +591,13 @@ func (p *logicalReplicationPlanner) generatePlanImpl(
 		progress.ReplicatedTime,
 		progress.Checkpoint,
 		tableMetadataByDestID,
+		plan.SourceTypes,
 		p.job.ID(),
 		streampb.StreamID(payload.StreamID),
 		payload.Discard,
 		payload.Mode,
 		payload.MetricsLabel,
+		writer,
 	)
 	if err != nil {
 		return nil, nil, info, err
@@ -614,6 +633,7 @@ func (p *logicalReplicationPlanner) generatePlanImpl(
 		execinfrapb.PostProcessSpec{},
 		logicalReplicationWriterResultType,
 		execinfrapb.Ordering{},
+		nil, /* finalizeLastStageCb */
 	)
 	physicalPlan.PlanToStreamColMap = []int{0}
 	sql.FinalizePlan(ctx, planCtx, physicalPlan)
@@ -706,6 +726,7 @@ func (p *logicalReplicationPlanner) planOfflineInitialScan(
 		execinfrapb.PostProcessSpec{},
 		logicalReplicationWriterResultType,
 		execinfrapb.Ordering{},
+		nil, /* finalizeLastStageCb */
 	)
 
 	physPlan.PlanToStreamColMap = []int{0}
@@ -726,9 +747,27 @@ type rowHandler struct {
 	rangeStats rangeStatsByProcessorID
 
 	lastPartitionUpdate time.Time
+
+	r *logicalReplicationResumer
+}
+
+func (rh *rowHandler) handleTraceAgg(agg *execinfrapb.TracingAggregatorEvents) {
+	componentID := execinfrapb.ComponentID{
+		FlowID:        agg.FlowID,
+		SQLInstanceID: agg.SQLInstanceID,
+	}
+	// Update the running aggregate of the component with the latest received
+	// aggregate.
+	rh.r.mu.Lock()
+	defer rh.r.mu.Unlock()
+	rh.r.mu.perNodeAggregatorStats[componentID] = *agg
 }
 
 func (rh *rowHandler) handleMeta(ctx context.Context, meta *execinfrapb.ProducerMetadata) error {
+	if meta.AggregatorEvents != nil {
+		rh.handleTraceAgg(meta.AggregatorEvents)
+	}
+
 	if meta.BulkProcessorProgress == nil {
 		log.VInfof(ctx, 2, "received non progress producer meta: %v", meta)
 		return nil
@@ -760,18 +799,18 @@ func (rh *rowHandler) handleRow(ctx context.Context, row tree.Datums) error {
 			return err
 		}
 	}
+	replicatedTime := rh.frontier.Frontier()
+	alwaysPersist := rh.replicatedTimeAtStart.Less(replicatedTime) && rh.replicatedTimeAtStart.IsEmpty()
 
 	updateFreq := jobCheckpointFrequency.Get(rh.settings)
-	if updateFreq == 0 || timeutil.Since(rh.lastPartitionUpdate) < updateFreq {
+	if !alwaysPersist && (updateFreq == 0 || timeutil.Since(rh.lastPartitionUpdate) < updateFreq) {
 		return nil
 	}
 
 	frontierResolvedSpans := make([]jobspb.ResolvedSpan, 0)
-	rh.frontier.Entries(func(sp roachpb.Span, ts hlc.Timestamp) (done span.OpResult) {
+	for sp, ts := range rh.frontier.Entries() {
 		frontierResolvedSpans = append(frontierResolvedSpans, jobspb.ResolvedSpan{Span: sp, Timestamp: ts})
-		return span.ContinueMatch
-	})
-	replicatedTime := rh.frontier.Frontier()
+	}
 
 	rh.lastPartitionUpdate = timeutil.Now()
 	log.VInfof(ctx, 2, "persisting replicated time of %s", replicatedTime.GoTime())
@@ -786,7 +825,7 @@ func (rh *rowHandler) handleRow(ctx context.Context, row tree.Datums) error {
 
 			// TODO (msbutler): add ldr initial and lagging range timeseries metrics.
 			aggRangeStats, fractionCompleted, status := rh.rangeStats.RollupStats()
-			progress.RunningStatus = status
+			progress.StatusMessage = status
 
 			if replicatedTime.IsSet() {
 				prog.ReplicatedTime = replicatedTime
@@ -923,9 +962,32 @@ func (r *logicalReplicationResumer) OnFailOrCancel(
 	return nil
 }
 
-// CollectProfile implements jobs.Resumer interface
-func (r *logicalReplicationResumer) CollectProfile(_ context.Context, _ interface{}) error {
+// CollectProfile implements the jobs.Resumer interface.
+func (r *logicalReplicationResumer) CollectProfile(ctx context.Context, execCtx interface{}) error {
+	p := execCtx.(sql.JobExecContext)
+	var aggStatsCopy bulk.ComponentAggregatorStats
+	func() {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		aggStatsCopy = r.mu.perNodeAggregatorStats.DeepCopy()
+	}()
+
+	if err := bulk.FlushTracingAggregatorStats(ctx, r.job.ID(),
+		p.ExecCfg().InternalDB, aggStatsCopy); err != nil {
+		return errors.Wrap(err, "failed to flush aggregator stats")
+	}
+
 	return nil
+}
+
+// ForceRealSpan implements the TraceableJob interface.
+func (r *logicalReplicationResumer) ForceRealSpan() bool {
+	return true
+}
+
+// DumpTraceAfterRun implements the TraceableJob interface.
+func (r *logicalReplicationResumer) DumpTraceAfterRun() bool {
+	return false
 }
 
 func (r *logicalReplicationResumer) completeProducerJob(
@@ -990,6 +1052,12 @@ func init() {
 		func(job *jobs.Job, _ *cluster.Settings) jobs.Resumer {
 			return &logicalReplicationResumer{
 				job: job,
+				mu: struct {
+					syncutil.Mutex
+					perNodeAggregatorStats bulk.ComponentAggregatorStats
+				}{
+					perNodeAggregatorStats: make(bulk.ComponentAggregatorStats),
+				},
 			}
 		},
 		jobs.WithJobMetrics(m),

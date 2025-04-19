@@ -405,6 +405,9 @@ func (og *operationGenerator) addUniqueConstraint(ctx context.Context, tx pgx.Tx
 
 	if !canApplyConstraint {
 		og.candidateExpectedCommitErrors.add(pgcode.UniqueViolation)
+		// For newly created tables its possible for the execution to
+		// the unique violation error.
+		stmt.potentialExecErrors.add(pgcode.UniqueViolation)
 	} else {
 		// Otherwise there is still a possibility for an error,
 		// so add it in the potential set, since our validation query
@@ -1157,6 +1160,11 @@ func (og *operationGenerator) createIndex(ctx context.Context, tx pgx.Tx) (*opSt
 			{code: pgcode.FeatureNotSupported, condition: hasAlterPKSchemaChange && !og.useDeclarativeSchemaChanger},
 			{code: pgcode.FeatureNotSupported, condition: lastColInvertedIndexIsDescending},
 			{code: pgcode.FeatureNotSupported, condition: pkColUsedInInvertedIndex},
+		})
+		// Unique violations can occur at the statement phase if the table is
+		// new.
+		stmt.potentialExecErrors.addAll(codesWithConditions{
+			{code: pgcode.UniqueViolation, condition: !uniqueViolationWillNotOccur},
 		})
 	}
 
@@ -2476,6 +2484,9 @@ func (og *operationGenerator) setColumnNotNull(ctx context.Context, tx pgx.Tx) (
 		}
 		if colContainsNull {
 			og.candidateExpectedCommitErrors.add(pgcode.NotNullViolation)
+			// If the table is created within the txn, then the not null violation
+			// will be an execution error.
+			stmt.potentialExecErrors.add(pgcode.NotNullViolation)
 		}
 		// If we are running with the legacy schema changer, the not null constraint
 		// is enforced during the job phase. So it's still possible to INSERT not null
@@ -2791,9 +2802,6 @@ func (og *operationGenerator) alterTableAlterPrimaryKey(
 		return nil, err
 	}
 
-	// TODO(sql-foundations): Until #130165 is resolved, we add this potential
-	// error.
-	og.potentialCommitErrors.add(pgcode.DuplicateColumn)
 	// There is a risk of unique violations if concurrent inserts
 	// happen during an ALTER PRIMARY KEY. So allow this to be
 	// a potential error on the commit.
@@ -3010,6 +3018,7 @@ func (og *operationGenerator) insertRow(ctx context.Context, tx pgx.Tx) (stmt *o
 	// Only evaluate these if we know that the inserted values are sane, since
 	// we will need to evaluate generated expressions below.
 	hasUniqueConstraints := false
+	hasUniqueConstraintsMutations := false
 	fkViolation := false
 	if !anyInvalidInserts {
 		// Verify if the new row may violate unique constraints by checking the
@@ -3019,6 +3028,12 @@ func (og *operationGenerator) insertRow(ctx context.Context, tx pgx.Tx) (stmt *o
 			return nil, err
 		}
 		hasUniqueConstraints = len(constraints) > 0
+		// If we have any unique constraint mutations pending then its always possible,
+		// for us to still violate them.
+		hasUniqueConstraintsMutations, err = og.tableHasUniqueConstraintMutation(ctx, tx, tableName)
+		if err != nil {
+			return nil, err
+		}
 		// Verify if the new row will violate fk constraints by checking the constraints and rows
 		// in the database.
 		fkViolation, err = og.violatesFkConstraints(ctx, tx, tableName, nonGeneratedColNames, rows)
@@ -3029,10 +3044,11 @@ func (og *operationGenerator) insertRow(ctx context.Context, tx pgx.Tx) (stmt *o
 	}
 
 	stmt.potentialExecErrors.addAll(codesWithConditions{
-		{code: pgcode.UniqueViolation, condition: hasUniqueConstraints},
+		{code: pgcode.UniqueViolation, condition: hasUniqueConstraints || hasUniqueConstraintsMutations},
 		{code: pgcode.ForeignKeyViolation, condition: fkViolation},
 		{code: pgcode.NotNullViolation, condition: true},
 		{code: pgcode.CheckViolation, condition: true},
+		{code: pgcode.InsufficientPrivilege, condition: true}, // For RLS violations
 	})
 	og.expectedCommitErrors.addAll(codesWithConditions{
 		{code: pgcode.ForeignKeyViolation, condition: fkViolation},
@@ -3233,6 +3249,17 @@ func (s *opStmt) executeStmt(ctx context.Context, tx pgx.Tx, og *operationGenera
 				errRunInTxnRbkSentinel,
 			)
 		}
+
+		// Command is too large errors are allowed on DML operations since,
+		// some of the tables can be pretty wide in this test.
+		if s.queryType == OpStmtDML && pgcode.MakeCode(pgErr.Code) == pgcode.Uncategorized &&
+			strings.Contains(pgErr.Error(), "command is too large") {
+			return errors.Mark(
+				err,
+				errRunInTxnRbkSentinel,
+			)
+		}
+
 		if !s.expectedExecErrors.contains(pgcode.MakeCode(pgErr.Code)) &&
 			!s.potentialExecErrors.contains(pgcode.MakeCode(pgErr.Code)) {
 			return errors.Mark(
@@ -4835,4 +4862,46 @@ func (og *operationGenerator) setSeedInDB(ctx context.Context, tx pgx.Tx) error 
 		return err
 	}
 	return nil
+}
+
+func (og *operationGenerator) alterTableRLS(ctx context.Context, tx pgx.Tx) (*opStmt, error) {
+	tableName, err := og.randTable(ctx, tx, og.pctExisting(true), "")
+	if err != nil {
+		return nil, err
+	}
+
+	tableExists, err := og.tableExists(ctx, tx, tableName)
+	if err != nil {
+		return nil, err
+	}
+
+	// Define the available RLS options
+	rlsOptions := []string{
+		"ENABLE ROW LEVEL SECURITY",
+		"DISABLE ROW LEVEL SECURITY",
+		"FORCE ROW LEVEL SECURITY",
+		"NO FORCE ROW LEVEL SECURITY",
+	}
+
+	// Randomly decide between 1 or 2 options
+	numOptions := og.randIntn(2) + 1
+
+	// Randomly select a unique permutation of the options
+	perm := og.params.rng.Perm(len(rlsOptions))
+	selectedOptions := make([]string, numOptions)
+	for i := 0; i < numOptions; i++ {
+		selectedOptions[i] = rlsOptions[perm[i]]
+	}
+
+	// Build the SQL statement
+	sqlStatement := fmt.Sprintf(`ALTER TABLE %s %s`, tableName, strings.Join(selectedOptions, ", "))
+
+	opStmt := makeOpStmt(OpStmtDDL)
+	opStmt.expectedExecErrors.addAll(codesWithConditions{
+		{code: pgcode.FeatureNotSupported, condition: !og.useDeclarativeSchemaChanger},
+		{code: pgcode.UndefinedTable, condition: !tableExists},
+	})
+
+	opStmt.sql = sqlStatement
+	return opStmt, nil
 }

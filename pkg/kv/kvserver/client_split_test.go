@@ -49,7 +49,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigtestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/bootstrap"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/systemschema"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/storage/fs"
@@ -61,6 +60,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/ts"
 	"github.com/cockroachdb/cockroach/pkg/ts/tspb"
+	"github.com/cockroachdb/cockroach/pkg/upgrade/upgradebase"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -957,9 +957,10 @@ func TestStoreRangeSplitWithConcurrentWrites(t *testing.T) {
 					s := serverutils.StartServerOnly(t, base.TestServerArgs{
 						Knobs: base.TestingKnobs{
 							Store: &kvserver.StoreTestingKnobs{
-								DisableMergeQueue:    true,
-								DisableSplitQueue:    true,
-								TestingRequestFilter: filter,
+								DisableMergeQueue:       true,
+								DisableSplitQueue:       true,
+								DisableConsistencyQueue: true,
+								TestingRequestFilter:    filter,
 							},
 						},
 						Settings: settings,
@@ -1061,8 +1062,7 @@ func TestStoreRangeSplitWithConcurrentWrites(t *testing.T) {
 						assertRecomputedStats(t, "LHS2 after second split", snap, lhs2Repl.Desc(), lhs2Stats, s.Clock().PhysicalNow())
 						assertRecomputedStats(t, "RHS1 after second split", snap, rhsRepl.Desc(), rhs1Stats, s.Clock().PhysicalNow())
 						assertRecomputedStats(t, "RHS2 after second split", snap, rhs2Repl.Desc(), rhs2Stats, s.Clock().PhysicalNow())
-					}
-					if expectContainsEstimates {
+					} else {
 						require.Greater(t, lhs1Stats.ContainsEstimates, int64(0))
 						require.Greater(t, lhs2Stats.ContainsEstimates, int64(0))
 						// The range corresponding to rhs1Stats is empty, so the split of the
@@ -3061,8 +3061,8 @@ func TestUnsplittableRange(t *testing.T) {
 			SpanConfig: &spanconfig.TestingKnobs{
 				ProtectedTSReaderOverrideFn: spanconfig.EmptyProtectedTSReader,
 			},
-			KeyVisualizer: &keyvisualizer.TestingKnobs{SkipZoneConfigBootstrap: true},
-			SQLStatsKnobs: &sqlstats.TestingKnobs{SkipZoneConfigBootstrap: true},
+			KeyVisualizer:  &keyvisualizer.TestingKnobs{SkipZoneConfigBootstrap: true},
+			UpgradeManager: &upgradebase.TestingKnobs{SkipZoneConfigBootstrap: true},
 		},
 	})
 
@@ -4140,7 +4140,12 @@ func TestStoreRangeSplitAndMergeWithGlobalReads(t *testing.T) {
 
 	// Verify that the closed timestamp policy is set up.
 	repl := store.LookupReplica(roachpb.RKey(descKey))
-	require.Equal(t, repl.ClosedTimestampPolicy(), roachpb.LEAD_FOR_GLOBAL_READS)
+	testutils.SucceedsSoon(t, func() error {
+		if actual := repl.ClosedTimestampPolicy(); actual != roachpb.LEAD_FOR_GLOBAL_READS {
+			return errors.Newf("expected LEAD_FOR_GLOBAL_READS, got %s", actual)
+		}
+		return nil
+	})
 
 	// Write to the range, which has the effect of bumping the closed timestamp.
 	pArgs := putArgs(descKey, []byte("foo"))

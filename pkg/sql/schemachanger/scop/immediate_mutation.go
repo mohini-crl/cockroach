@@ -38,6 +38,7 @@ type NotImplementedForPublicObjects struct {
 	immediateMutationOp
 	ElementType string
 	DescID      catid.DescID
+	TriggerID   catid.TriggerID
 }
 
 // UndoAllInTxnImmediateMutationOpSideEffects undoes the side effects of all
@@ -623,17 +624,19 @@ type RemovePolicyRole struct {
 // SetPolicyUsingExpression will set a new USING expression for a policy.
 type SetPolicyUsingExpression struct {
 	immediateMutationOp
-	TableID  descpb.ID
-	PolicyID descpb.PolicyID
-	Expr     string
+	TableID   descpb.ID
+	PolicyID  descpb.PolicyID
+	Expr      string
+	ColumnIDs descpb.ColumnIDs
 }
 
 // SetPolicyWithCheckExpression will set a new WITH CHECK expression for a policy.
 type SetPolicyWithCheckExpression struct {
 	immediateMutationOp
-	TableID  descpb.ID
-	PolicyID descpb.PolicyID
-	Expr     string
+	TableID   descpb.ID
+	PolicyID  descpb.PolicyID
+	Expr      string
+	ColumnIDs descpb.ColumnIDs
 }
 
 // SetPolicyForwardReferences sets new forward references to relations, types,
@@ -1145,4 +1148,30 @@ type ForcedRowLevelSecurityMode struct {
 	immediateMutationOp
 	TableID descpb.ID
 	Forced  bool
+}
+
+// MarkRecreatedIndexAsInvisible is used to mark secondary indexes recreated
+// after a primary key swap as invisible. This is to prevent their use before
+// primary key swap is complete.
+type MarkRecreatedIndexAsInvisible struct {
+	immediateMutationOp
+	TableID              descpb.ID
+	IndexID              descpb.IndexID
+	TargetPrimaryIndexID descpb.IndexID
+}
+
+// MarkRecreatedIndexesAsVisible is used to mark secondary indexes recreated
+// after a primary key swap as visible. This is to allow their use after
+// primary key swap is complete.
+type MarkRecreatedIndexesAsVisible struct {
+	immediateMutationOp
+	TableID           descpb.ID
+	IndexVisibilities map[descpb.IndexID]float64
+}
+
+// SetTableSchemaLocked is used to toggle a table schema as locked.
+type SetTableSchemaLocked struct {
+	immediateMutationOp
+	TableID descpb.ID
+	Locked  bool
 }

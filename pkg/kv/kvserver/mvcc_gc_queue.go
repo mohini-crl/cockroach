@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/gc"
@@ -25,7 +26,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
-	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/grunning"
@@ -585,6 +585,11 @@ func (r *replicaGCer) template() kvpb.GCRequest {
 	desc := r.repl.Desc()
 	var template kvpb.GCRequest
 	template.Key = desc.StartKey.AsRawKey()
+	if r.repl.RangeID == 1 {
+		// r1 should really start at LocalMax but it starts "officially" at KeyMin
+		// which is not addressable.
+		template.Key = keys.LocalMax
+	}
 	template.EndKey = desc.EndKey.AsRawKey()
 
 	return template
@@ -594,31 +599,13 @@ func (r *replicaGCer) send(ctx context.Context, req kvpb.GCRequest) error {
 	n := atomic.AddInt32(&r.count, 1)
 	log.Eventf(ctx, "sending batch %d (%d keys, %d rangekeys)", n, len(req.Keys), len(req.RangeKeys))
 
-	ba := &kvpb.BatchRequest{}
-	// Technically not needed since we're talking directly to the Replica.
-	ba.RangeID = r.repl.Desc().RangeID
-	ba.Timestamp = r.repl.Clock().Now()
-	ba.Add(&req)
-	// Since we are talking directly to the replica, we need to explicitly do
-	// admission control here, as we are bypassing server.Node.
-	var admissionHandle kvadmission.Handle
-	if r.admissionController != nil {
-		ba.AdmissionHeader = gcAdmissionHeader(r.repl.ClusterSettings())
-		ba.Replica.StoreID = r.storeID
-		var err error
-		admissionHandle, err = r.admissionController.AdmitKVWork(ctx, roachpb.SystemTenantID, ba)
-		if err != nil {
-			return err
-		}
-	}
-	_, writeBytes, pErr := r.repl.SendWithWriteBytes(ctx, ba)
-	defer writeBytes.Release()
-	if r.admissionController != nil {
-		r.admissionController.AdmittedKVWorkDone(admissionHandle, writeBytes)
-	}
-	if pErr != nil {
-		log.VErrEventf(ctx, 2, "%v", pErr.String())
-		return pErr.GoError()
+	var b kv.Batch
+	b.AddRawRequest(&req)
+	b.AdmissionHeader = gcAdmissionHeader(r.repl.ClusterSettings())
+
+	if err := r.repl.store.cfg.DB.Run(ctx, &b); err != nil {
+		log.Infof(ctx, "%s", err)
+		return err
 	}
 	return nil
 }
@@ -715,18 +702,11 @@ func (mgcq *mvccGCQueue) process(
 		log.VErrEventf(ctx, 2, "failed to update last processed time: %v", err)
 	}
 
-	var snap storage.Reader
-	if repl.store.cfg.SharedStorageEnabled || storage.ShouldUseEFOS(&repl.ClusterSettings().SV) {
-		efos := repl.store.TODOEngine().NewEventuallyFileOnlySnapshot(rditer.MakeReplicatedKeySpans(desc))
-		if util.RaceEnabled {
-			ss := rditer.MakeReplicatedKeySpanSet(desc)
-			defer ss.Release()
-			snap = spanset.NewEventuallyFileOnlySnapshot(efos, ss)
-		} else {
-			snap = efos
-		}
-	} else {
-		snap = repl.store.TODOEngine().NewSnapshot()
+	snap := repl.store.TODOEngine().NewSnapshot(rditer.MakeReplicatedKeySpans(desc)...)
+	if util.RaceEnabled {
+		ss := rditer.MakeReplicatedKeySpanSet(desc)
+		defer ss.Release()
+		snap = spanset.NewReader(snap, ss, hlc.Timestamp{})
 	}
 	defer snap.Close()
 
